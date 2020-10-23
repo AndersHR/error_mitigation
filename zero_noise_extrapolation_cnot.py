@@ -1,4 +1,4 @@
-from qiskit import QuantumCircuit, execute, Aer
+from qiskit import QuantumCircuit, execute, Aer, transpile
 
 from qiskit.transpiler import PassManager, PassManagerConfig, CouplingMap
 from qiskit.transpiler.passes import Unroller, Optimize1qGates
@@ -165,8 +165,9 @@ class ZeroNoiseExtrapolation:
 
         if custom_pass_manager == None:
             pass_manager_config = PassManagerConfig(basis_gates=["id", "u1", "u2", "u3", "cx"],
-                                                    coupling_map=CouplingMap(self.backend.configuration().coupling_map),
                                                     backend_properties=self.backend.properties())
+            if not self.backend.configuration().simulator:
+                pass_manager_config.coupling_map = CouplingMap(self.backend.configuration().coupling_map)
             pass_manager = level_3_pass_manager(pass_manager_config)
         else:
             pass_manager = custom_pass_manager
@@ -288,7 +289,7 @@ class ZeroNoiseExtrapolation:
 
         if verbose:
             print("shots=", self.shots, ", n_amp_factors=", self.n_amp_factors, ", paulitwirl=", self.pauli_twirl,
-                  " repeats=", repeats, sep="")
+                  ", repeats=", repeats, sep="")
             print("noise amplification factors=", self.noise_amplification_factors, sep="")
 
         if verbose:
@@ -296,16 +297,13 @@ class ZeroNoiseExtrapolation:
 
         circuits = []
 
-        for i in range(repeats):
+        for j, amp_factor in enumerate(self.noise_amplification_factors):
+            circuits.append(self.noise_amplify_and_pauli_twirl_cnots(qc=self.qc, amp_factor=amp_factor,
+                                                                     pauli_twirl=self.pauli_twirl))
+            self.depths[j] = circuits[-1].depth()
 
-            if verbose and ((i + 1) % 25 == 0):
-                print(i+1,"/",repeats)
-
-            for j, amp_factor in enumerate(self.noise_amplification_factors):
-                circuits.append(self.noise_amplify_and_pauli_twirl_cnots(qc=self.qc, amp_factor=amp_factor,
-                                                                         pauli_twirl=self.pauli_twirl))
-                if i == 0:
-                    self.depths[j] = circuits[-1].depth()
+        if repeats != 1:
+            circuits = circuits * repeats
 
         if verbose:
             print("Depths=",self.depths, sep="")
@@ -323,10 +321,15 @@ class ZeroNoiseExtrapolation:
         self.mitigated_exp_vals = zeros((repeats,))
 
         if verbose:
-            print("Processing results:")
+            print("Processing results")
 
         if repeats == 1:
+            self.bare_exp_vals[0] = exp_vals[0]
+            self.all_exp_vals[0,:] = exp_vals
+
             self.result = richardson_extrapolate(self.all_exp_vals[0,:], self.noise_amplification_factors)
+
+            self.mitigated_exp_vals[0] = self.result
         else:
             for i in range(repeats):
                 self.bare_exp_vals[i] = exp_vals[i*n_amp_factors]
