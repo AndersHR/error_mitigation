@@ -47,8 +47,10 @@ class ZeroNoiseExtrapolation:
 
         if backend == None:
             self.backend = Aer.get_backend("qasm_simulator")
+            self.is_simulator = True
         else:
             self.backend = backend
+            self.is_simulator = backend.configuration().simulator
 
         # Do an initial heavy optimization of the input circuit
         self.qc = self.transpile_circuit(qc, custom_pass_manager=pass_manager)
@@ -166,13 +168,14 @@ class ZeroNoiseExtrapolation:
         if custom_pass_manager == None:
             pass_manager_config = PassManagerConfig(basis_gates=["id", "u1", "u2", "u3", "cx"],
                                                     backend_properties=self.backend.properties())
-            if not self.backend.configuration().simulator:
+            if not self.is_simulator:
                 pass_manager_config.coupling_map = CouplingMap(self.backend.configuration().coupling_map)
+
             pass_manager = level_3_pass_manager(pass_manager_config)
         else:
             pass_manager = custom_pass_manager
 
-        self.passes = pass_manager.passes()
+        self.passes = pass_manager.passes() # Saves the list of passes used for transpiling
 
         return pass_manager.run(qc)
 
@@ -180,6 +183,9 @@ class ZeroNoiseExtrapolation:
         """
         Execute all circuits and return measurement counts. If shots > 8192, we need to partition the execution
         into several sub-executions.
+
+        Circuits are transpiled and optimized beforehand, thus we pass an empty PassManager to qiskit.execute
+        to avoid unnecessary time spent on transpiling.
 
         :param circuits: All circuits to be executed
         :return: A list of count-dictionaries
@@ -191,18 +197,17 @@ class ZeroNoiseExtrapolation:
         for qc in circuits:
             execution_circuits += [qc.copy() for i in range(self.num_executions)]
 
-        #
-
-        if self.noise_model == None:
-            counts = execute(execution_circuits, backend=self.backend,
-                             pass_manager=PassManager(), shots=self.shots).result().get_counts()
+        # non-simulator backends throws unexpected argument when passing noise_model argument to them
+        if self.is_simulator:
+            result = execute(execution_circuits, backend=self.backend, noise_model=self.noise_model,
+                             pass_manager=PassManager(), shots=self.shots).result()
         else:
-            counts = execute(execution_circuits, backend=self.backend, noise_model=self.noise_model,
-                             pass_manager=PassManager(), shots=self.shots).result().get_counts()
+            result = execute(execution_circuits, backend=self.backend,
+                             pass_manager=PassManager(), shots=self.shots).result()
 
-        self.counts = counts    # Saving the counts in a member variable. Might remove.
+        self.result = result    # Saving the result in a member variable. Might remove.
 
-        return counts
+        return result.get_counts()
 
     def compute_exp_vals(self, counts: list) -> ndarray:
         """
