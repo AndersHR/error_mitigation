@@ -509,7 +509,7 @@ class ZeroNoiseExtrapolation:
         # u3 gates it collapses any chain of adjacent single-qubit gates into a single, equivalent u3-gate.
         # We want to collapse unnecessary single-qubit gates to minimize circuit depth, but not CNOT-gates
         # as these give us the noise amplification.
-        unroller_backendspecific = Unroller(self.backend.configuration().coupling_map())
+        unroller_backendspecific = Unroller(self.backend.configuration().basis_gates)
         optimize1qates = Optimize1qGates()
 
         pm = PassManager([unroller_backendspecific, optimize1qates])
