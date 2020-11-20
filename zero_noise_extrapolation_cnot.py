@@ -18,11 +18,13 @@ a quantum circuit by a set of noise amplification factors, then using Richardson
 expectation value to the zero-noise limit.
 
 The noise amplified and mitigated is specifically noise in CNOT-gates. The noise is amplified by n amplification
-factors 1, 3, 5, ..., 2n + 1, where 1 means the bare circuit without noise amplification, and 3 means every
-CNOT gate is extended as CNOT*CNOT*CNOT.
+factors c=1, 3, 5, ..., 2n + 1 by repeating each CNOT gates c times. E.g. c=1 corresponds to the bare circuit and
+c=3 corresponds to each CNOT gate replaced by CNOT*CNOT*CNOT. Each CNOT acting on the same control- and target-qubits
+as the original CNOT-gate.
 
-As CNOT*CNOT = Id, the identity, in the noise-free case the amplified CNOT have the same action as a single CNOT, 
-but ~3 times the noise.
+As CNOT*CNOT = Id, the identity, in the noise-free case the amplified CNOT (eqaul to CNOT^c) have the same action as a
+single CNOT. In the noise-afflicted case, the action will be close to that of a single CNOT for a weak noise, but with
+the CNOT-noise applied c times to the qubit throughout the process.
 
 """
 
@@ -52,7 +54,8 @@ class ZeroNoiseExtrapolation:
             self.backend = backend
             self.is_simulator = backend.configuration().simulator
 
-        # Do an initial heavy optimization of the input circuit
+        # Do an initial optimization of the quantum circuit. If no custom pass manager is passer, the optimizaiton is
+        # done with the optimization_level=3 preset for the qiskit transpiler (heaviest optimization)
         self.qc = self.transpile_circuit(qc, custom_pass_manager=pass_manager)
 
         self.exp_val_func = exp_val_func
@@ -83,7 +86,7 @@ class ZeroNoiseExtrapolation:
         self.all_exp_vals = zeros(0)
         self.mitigated_exp_vals = zeros(0)
 
-        self.result = None
+        self.measurement_results = []
 
     def set_shots(self, shots: int):
         if shots <= 8192:
@@ -109,18 +112,19 @@ class ZeroNoiseExtrapolation:
         """
 
         if (amp_factor - 1) % 2 != 0:
-            print("Invalid amplification factor:", amp_factor)
+            raise Exception("Invalid amplification factors", amp_factor)
 
         # The circuit may be expressed in terms of various types of gates.
         # The 'Unroller' transpiler pass 'unrolls' (decomposes) the circuit gates to be expressed in terms of the
         # physical gate set [u1,u2,u3,cx]
 
-        # This is still general for backends with possibly different native gate sets, as we can still express the
-        # circuit, and do the noise amplification + pauli twirling, in terms of the [u1,u2,u3,cx] gate set, and then
-        # if necessary convert to the native gate set of the backend at a later point
+        # The cz, cy (controlled-Z and -Y) gates can be constructed from a single cx-gate and sinlge-qubit gates.
+        # For backends with native gate sets consisting of some set of single-qubit gates and either the cx, cz or cy,
+        # unrolling the circuit to the ["u3", "cx"] basis, amplifying the cx-gates, then unrolling back to the native
+        # gate set and doing a single-qubit optimization transpiler pass, is thus still general.
 
-        unroller = Unroller(["u1","u2","u3","cx"])
-        pm = PassManager(unroller)
+        unroller_ugatesandcx = Unroller(["u1","u2","u3","cx"])
+        pm = PassManager(unroller_ugatesandcx)
 
         unrolled_qc = pm.run(qc)
 
@@ -141,26 +145,30 @@ class ZeroNoiseExtrapolation:
 
         new_qc = QuantumCircuit.from_qasm_str(new_circuit_qasm_str)
 
-        # The "Optimize1qGates" transpiler pass optimizes chains of single-qubit gates by collapsing them into
-        # a single, equivalent u3-gate. We want to collapse unnecessary single-qubit gates, but not CNOT-gates, as
-        # these give us the noise amplification.
+        # The "Optimize1qGates" transpiler pass optimizes adjacent single-qubit gates, for a native gate set with the
+        # u3 gates it collapses any chain of adjacent single-qubit gates into a single, equivalent u3-gate.
+        # We want to collapse unnecessary single-qubit gates to minimize circuit depth, but not CNOT-gates
+        # as these give us the noise amplification.
+        unroller_backendspecific = Unroller(self.backend.configuration().coupling_map())
         optimize1qates = Optimize1qGates()
-        pm = PassManager(optimize1qates)
+
+        pm = PassManager([unroller_backendspecific, optimize1qates])
 
         return pm.run(new_qc)
 
     def transpile_circuit(self, qc: QuantumCircuit, custom_pass_manager: PassManager = None) -> QuantumCircuit:
         """
-        Transpile and optimize the quantum circuit using qiskits PassManager class and the level_3_pass_manager,
-        which contains the transpiler passes for the optimalization level 3 preset (the preset with highest
-        level of optimization).
+        Transpile and optimize the input circuit, optionally using a custom pass manager.
+        If no custom pass manager is given, use the optimization_level 3 preset for the qiskit transpiler,
+        which gives heaviest circuit optimization.
 
         As we want to add additional CNOTs for noise amplification and possibly additional single qubit gates
-        for Pauli twirling, we need to transpile the circuit before, to avoid the additional gates to be removed
-        by the transpiler.
+        for Pauli twirling, we need to transpile the circuit before both the noise amplification is applied and
+        before circuit execution. This is to avoid the additional CNOT-gates beinng removed by the transpiler.
 
         The Optimize1qGates transpiler pass will be used later to optimize single qubit gates added during
-        the Pauli-twirling
+        the Pauli-twirling, as well as the Unroller pass which merely decomposes the given circuit gates into
+        the given set of basis gates.
 
         :return: The transpiled circuit
         """
@@ -205,7 +213,7 @@ class ZeroNoiseExtrapolation:
             result = execute(execution_circuits, backend=self.backend,
                              pass_manager=PassManager(), shots=self.shots).result()
 
-        self.result = result    # Saving the result in a member variable. Might remove.
+        self.measurement_results.append(result)    # Saving the result in a member variable. Might remove.
 
         return result.get_counts()
 
@@ -293,8 +301,8 @@ class ZeroNoiseExtrapolation:
         n_amp_factors = shape(self.noise_amplification_factors)[0]
 
         if verbose:
-            print("shots=", self.shots, ", n_amp_factors=", self.n_amp_factors, ", paulitwirl=", self.pauli_twirl,
-                  ", repeats=", repeats, sep="")
+            print("repeats=", repeats ,", shots per repats=", self.shots, ", n_amp_factors=", self.n_amp_factors,
+                  ", paulitwirl=", self.pauli_twirl, sep="")
             print("noise amplification factors=", self.noise_amplification_factors, sep="")
 
         if verbose:
@@ -316,6 +324,8 @@ class ZeroNoiseExtrapolation:
             print("Executing circuits")
 
         counts = self.execute_circuits(circuits)
+
+        self.counts = counts
 
         exp_vals = self.compute_exp_vals(counts)
 
@@ -400,7 +410,8 @@ def find_cnot_control_and_target(qasm_line: str) -> (int, int):
 
 def propagate(control_in: str, target_in: str):
     """
-    Propagates Pauli gates through a CNOT in accordance with the following circuit identities:
+    Finds the c,d gates such that (a x b) CNOT (c x d) = CNOT for an ideal CNOT-gate, based on the a (control_in)
+    and b (target_in) pauli gates by "propagating" the a,b gates over a CNOT-gate by the following identities:
 
     (X x I) CNOT = CNOT (X x X)
     (I x X) CNOT = CNOT (I x X)
@@ -408,7 +419,7 @@ def propagate(control_in: str, target_in: str):
     (I x Z) CNOT = XNOT (Z x Z)
 
     Note that instead of Pauli-twirling with [X,Z,Y] we use [X,Z,XZ] where XZ = -i*Y.
-    The inverse of XZ is ZX = -XZ = i*Y. Propagating over the CNOT, the complex factors cancels.
+    The inverse of XZ is ZX = -XZ = i*Y. The factors of plus minus i are global phase factors which can be ignored.
 
     :param control_in: Pauli gates on control qubit before CNOT
     :param target_in: Pauli gates on target qubit before CNOT
