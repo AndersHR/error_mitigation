@@ -8,6 +8,8 @@ from qiskit.transpiler.preset_passmanagers.level3 import level_3_pass_manager
 from numpy import asarray, ndarray, shape, zeros, empty, average, transpose, dot
 from numpy.linalg import solve
 
+from zero_noise_extrapolation import Richardson_extrapolate
+
 import random
 
 """
@@ -313,7 +315,7 @@ class ZeroNoiseExtrapolation:
 
             self.measurement_results.append(circuit_measurement_results)
 
-        self.result = richardson_extrapolate(self.noise_amplified_exp_vals, self.noise_amplification_factors)
+        self.result = Richardson_extrapolate(self.noise_amplified_exp_vals, self.noise_amplification_factors)[0]
 
         if verbose:
             print("-----", "\nError mitigation done",
@@ -508,32 +510,3 @@ def pauli_twirl_cnots(qc: QuantumCircuit) -> QuantumCircuit:
     pm = PassManager(optimize1qates)
 
     return pm.run(new_qc)
-
-
-# Richardson extrapolation:
-def richardson_extrapolate(E: ndarray, c: ndarray) -> float:
-    """
-    Code taken from github.com/OpenQuantumComputing/error_mitigation/ -> zero_noise_extrapolation.py and slightly modified
-    :param E: Expectation values
-    :param c: Noise amplification factors
-    :return: Extrapolation to the zero-limit
-    """
-    if isinstance(E, list):
-        E = asarray(E)
-    if isinstance(E, list):
-        c = asarray(c)
-
-    n = E.shape[0]
-    if c.shape[0] != n:
-        raise ValueError('E and c must have the same dimension.')
-    if n <= 1:
-        raise ValueError('the dimension of E and c must be larger than 1.')
-    A = zeros((n, n))
-    b = zeros((n, 1))
-    # must sum to 1
-    A[0, :] = 1
-    b[0] = 1
-    for k in range(1, n):
-        A[k, :] = c ** k
-    x = solve(A, b)
-    return dot(transpose(E), x)[0]
