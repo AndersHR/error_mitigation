@@ -10,7 +10,7 @@ from numpy.linalg import solve
 
 from zero_noise_extrapolation import Richardson_extrapolate
 
-import random
+import random, os, pickle
 
 """
 -- ZERO NOISE EXTRAPOLATION for CNOT-gates --
@@ -35,7 +35,7 @@ class ZeroNoiseExtrapolation:
 
     def __init__(self, qc: QuantumCircuit, exp_val_func, backend=None, noise_model=None,
                  n_amp_factors: int = 3, shots: int = 8192, pauli_twirl: bool = False, pass_manager: PassManager = None,
-                 save_results: bool = False, experiment_name: str = None, option: dict = None):
+                 save_results: bool = False, experiment_name: str = "", option: dict = None):
         """ CONSTRUCTOR
         :param qc: The quantum circuit to be mitigated
         :param exp_val_func: A function that computes the observed expectation value of some operator measured by the
@@ -59,10 +59,6 @@ class ZeroNoiseExtrapolation:
             self.backend = backend
             self.is_simulator = backend.configuration().simulator
 
-        # Do an initial optimization of the quantum circuit. Either with a custom pass manager, or with the
-        # optimization_level=3 transpiler preset (the heaviest optimization preset)
-        self.qc = self.transpile_circuit(qc, custom_pass_manager=pass_manager)
-
         self.exp_val_func = exp_val_func
 
         self.noise_model = noise_model
@@ -72,19 +68,28 @@ class ZeroNoiseExtrapolation:
 
         self.pauli_twirl = pauli_twirl
 
-        self.save_results = save_results
-        self.experiment_name = experiment_name
-        if save_results and experiment_name == None:
-            raise Exception("experiment_name cannot be empty when saving results")
-        if option == None:
-            self.option = {"directory": "/results/"}
-        else:
-            self.option = option
+        # Variables involved in saving of results to disk
+        self.save_results, self.option = save_results, option
+        self.experiment_name = ""
+        self.set_experiment_name(experiment_name)
+        if self.option == None:
+            self.option = {}
 
         # Max number of shots for one circuit execution on IBMQ devices is 8192.
         # To do more shots, we have to partition them up into several executions.
         self.shots, self.repeats = None, None
         self.shots, self.repeats = self.partition_shots(shots)
+
+        # Do an initial optimization of the quantum circuit. Either with a custom pass manager, or with the
+        # optimization_level=3 transpiler preset (the heaviest optimization preset)
+        circuit_read_from_file = False
+        if self.save_results:
+            qc_from_file = self.read_from_file(self.experiment_name + ".circuit")
+            if qc_from_file != None:
+                circuit_read_from_file = True
+                self.qc = qc_from_file
+        if not circuit_read_from_file:
+            self.qc = self.transpile_circuit(qc, custom_pass_manager=pass_manager)
 
         # Initialization of variables for later use:
 
@@ -117,13 +122,30 @@ class ZeroNoiseExtrapolation:
     def get_shots(self):
         return self.repeats * self.shots
 
-    def save_result(self):
-        if self.option == None:
-            option = {"directory": "/results/"}
-        else:
-            option = self.option
+    def set_experiment_name(self, experiment_name):
+        if self.save_results:
+            if experiment_name == "":
+                raise Exception("experiment_name cannot be empty when saving results")
+            self.experiment_name = experiment_name
+            self.experiment_name += "_ZNE_CNOTrep"
+            self.experiment_name += "_backend" + self.backend.name()
+            self.experiment_name += "_shots" + str(self.get_shots())
+            self.experiment_name += "_paulitwirling" + str(self.pauli_twirl)
 
-    def read_result(self):
+    def read_from_file(self, filename: str):
+        directory = self.option.get("directory", "results")
+        if os.path.isfile(directory + "/" + filename):
+            file = open(directory + "/" + filename, "rb")
+            data = pickle.load(file)
+            file.close()
+            return data
+        else:
+            return None
+
+    def write_to_file(self, filename: str, data):
+        directory = self.option.get("directory", "results")
+        file = open(directory + "/" + filename)
+        pickle.dump(data, file)
 
     def noise_amplify_and_pauli_twirl_cnots(self, qc: QuantumCircuit, amp_factor: int,
                                             pauli_twirl: bool) -> QuantumCircuit:
@@ -219,12 +241,12 @@ class ZeroNoiseExtrapolation:
         # As there is some randomness involved in the qiskit transpiling, we might want to save
         # the specific transpiled circuit that is used
         if self.save_results:
-            # TODO: Save transpiled circuit
-            pass
+            filename = self.experiment_name + ".circuit"
+            self.write_to_file(filename, transpiled_circuit)
 
         return transpiled_circuit
 
-    def execute_circuits(self, circuits: list, shots=None) -> Result:
+    def execute_circuits(self, qc: QuantumCircuit, shots=None) -> Result:
         """
         Execute all circuits and return measurement counts. If shots > 8192, we need to partition the execution
         into several sub-executions.
@@ -232,7 +254,7 @@ class ZeroNoiseExtrapolation:
         Circuits are transpiled and optimized beforehand, thus we pass an empty PassManager to qiskit.execute
         to avoid unnecessary time spent on transpiling.
 
-        :param circuits: All circuits to be executed
+        :param qc: Circuit to be executed
         :return: A list of count-dictionaries
         """
 
@@ -246,9 +268,7 @@ class ZeroNoiseExtrapolation:
         # The max number of shots on a single execution on the IBMQ devices is 8192.
         # If shots > 8192, we have to partition the execution into several sub-executions.
         # Note that several circuits can be entered into the IBMQ queue at once by being passed as a list.
-        execution_circuits = []
-        for qc in circuits:
-            execution_circuits += [qc.copy() for i in range(repeats)]
+        execution_circuits = [qc.copy() for i in range(repeats)]
 
         # non-simulator backends throws unexpected argument when passing noise_model argument to them
         if self.is_simulator:
@@ -259,8 +279,6 @@ class ZeroNoiseExtrapolation:
                           pass_manager=PassManager(), shots=shots)
 
         circuit_measurement_results = job.result()
-
-        self.measurement_results.append(circuit_measurement_results)
 
         return circuit_measurement_results
 
@@ -308,7 +326,24 @@ class ZeroNoiseExtrapolation:
         for i in range(n_amp_factors):
             print("Noise amplification factor ", i + 1, " of ", n_amp_factors)
 
-            circuit_measurement_results = self.execute_circuits(noise_amplified_circuits)
+            circuit_measurement_results, circuit_read_from_file = None, False
+
+            if self.save_results:
+                tmp = self.read_from_file(self.experiment_name + "_r{:}.results".format(self.noise_amplification_factors[i]))
+                if tmp != None:
+                    circuit_measurement_results = tmp
+                    circuit_read_from_file = True
+                    if verbose:
+                        print("Results successfully read")
+                else:
+                    if verbose:
+                        print("Results not found")
+
+            if not circuit_read_from_file:
+                circuit_measurement_results = self.execute_circuits(noise_amplified_circuits[i])
+                if self.save_results:
+                    self.write_to_file(self.experiment_name + "_r{:].results".format(self.noise_amplification_factors[i]),
+                                       circuit_measurement_results)
 
             self.noise_amplified_exp_vals[i], self.all_exp_vals[i, :] = self.compute_exp_val(
                 circuit_measurement_results)
