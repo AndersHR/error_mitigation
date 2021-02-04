@@ -59,46 +59,45 @@ class ZeroNoiseExtrapolation:
         backend :
             A qiskit backend, either an IBMQ quantum backend or a simulator backend, for circuit executions.
 
-        exp_val_options : dict, optional
+        exp_val_options : dict, (optional)
             Options for the exp_val_func expectation value function
 
-        noise_model : qiskit.providers.aer.noise.NoiseModel, optional
+        noise_model : qiskit.providers.aer.noise.NoiseModel, (optional)
             Custom noise model for circuit executions with the qasm simulator backend.
 
-        n_amp_factors : int
+        n_amp_factors : int, (default set to 3)
             The number of noise amplification factors to be used. For n number of amplification factors, the specific
             noise amplification factors will be [1, 3, 5, ..., 2*n - 1]. Larger amounts of noise amplification factors
             tend to give better results, but slower convergence thus requiring large amounts of shots.
             Higher noise amplification also increases circuit depth, scaling linearly with the amplification factor c_i,
             and at some point the circuit depth and the consecutive decoherence will eliminate any further advantage.
 
-        shots: int
+        shots: int, (default set to 8192)
+            The number of "shots" of each experiment to be executed, where one experiment is a single execution of a
+            quantum circuit. To obtain an error mitigated expectation value, a total of shots*n_amp_factors experiments
+            is performed.
 
+        pauli_twirl : bool, (optional)
+            Perform Pauli twirling of each noise amplified circuit, True / False.
 
-        pauli_twirl : bool
+        pass_manager: qiskit.transpiler.PassManager, (optional)
+            Optional custom pass_manager for circuit transpiling. If none is passed, the circuit will be transpiled
+            using the qiskit optimization_level=3 preset, which is the heaviest optimization preset.
 
-        pass_manager: qiskit.transpiler.PassManager, optional
+        save_results: bool, (optional)
+            If True, will attempt to read transpiled circuit and experiment results for each noise amplified from disk,
+            and if this fails, the transpiled circuit and/or experiment measurement results will be saved to disk.
 
-        save_results: bool, optional
+        experiment_name: string, (optional)
+            The experiment name used when reading and writing transpiled circuits and measurement results to disk.
+            The experiment name will form the base for the full filename for each written/read file.
+            This argument is required if save_result = True.
 
-        experiment_name: string, optional
+        option: dict, (optional)
+            Options for the writing/reading of transpiled circuits and measurement results.
+            option["directory"] gives the directory in which files will be written to/attempted to be read from.
+            If no option is passed, the default directory used will be option["directory"] = "results".
 
-        option: dict, optional
-
-        """
-        """ CONSTRUCTOR
-        :param qc: The quantum circuit to be mitigated
-        :param exp_val_func: A function that computes the observed expectation value of some operator measured by the
-                             quantum circuit. Should take a qiskit ExperimentResult object as it's sole argument
-        :param backend: The backend on which to execute the circuit
-        :param noise_model: Optinal custom noise model for execution on a simulator backend
-        :param n_amp_factors: Max number of amplification factors to be used. For n amplification factors, the specific
-                              amplification factors will be 1,3,5,...,2n - 1
-        :param pauli_twirl: Do pauli twirling True / False
-        :param shots: The number of shots for which each noise amplified circuit will be executed in order to
-                      estimate the expectation value of said circuit
-        :param pass_manager: Optional custom pass manager to use when transpiling the circuit
-        :param save_results: Save partial results to file, True / False
         """
 
         # Set backend for circuit execution
@@ -144,7 +143,7 @@ class ZeroNoiseExtrapolation:
 
         self.counts = []
 
-        self.depths = empty(n_amp_factors)
+        self.depths, self.gamma_factors = empty(n_amp_factors), empty(n_amp_factors)
 
         self.exp_vals = zeros(0)
         self.all_exp_vals = zeros(0)
