@@ -1,5 +1,7 @@
 from qiskit import QuantumCircuit, execute, Aer, transpile
+
 from qiskit.result.result import Result
+from qiskit.providers.aer.noise import NoiseModel
 
 from qiskit.transpiler import PassManager, PassManagerConfig, CouplingMap
 from qiskit.transpiler.passes import Unroller, Optimize1qGates
@@ -11,6 +13,8 @@ from numpy.linalg import solve
 from zero_noise_extrapolation import Richardson_extrapolate
 
 import random, os, pickle
+
+from typing import Callable
 
 """
 -- ZERO NOISE EXTRAPOLATION for CNOT-gates --
@@ -33,9 +37,55 @@ the CNOT-noise applied c times to the qubit throughout the process.
 
 class ZeroNoiseExtrapolation:
 
-    def __init__(self, qc: QuantumCircuit, exp_val_func, backend=None, noise_model=None,
-                 n_amp_factors: int = 3, shots: int = 8192, pauli_twirl: bool = False, pass_manager: PassManager = None,
+    def __init__(self, qc: QuantumCircuit, exp_val_func: Callable, backend=None, exp_val_options: dict = None,
+                 noise_model: NoiseModel = None, n_amp_factors: int = 3, shots: int = 8192,
+                 pauli_twirl: bool = False,pass_manager: PassManager = None,
                  save_results: bool = False, experiment_name: str = "", option: dict = None):
+        """
+        CONSTRUCTOR
+
+        Parameters
+        ----------
+        qc : qiskit.QuantumCircuit
+            A complete quantum circuit, with measurements, that we want to perform quantum error mitigation on.
+            When run on a quantum backend, the circuit should output a set of measurements results from which the
+            desired expectation value can be estimated.
+
+        exp_val_func : Callable
+            A function that computes the desired expectation value based on the measurement results outputted by the
+            quantum circuit. The function should take two arguments: a qiskit.result.result.Result object as its first,
+            and a dictionary with possible options as its second.
+
+        backend :
+            A qiskit backend, either an IBMQ quantum backend or a simulator backend, for circuit executions.
+
+        exp_val_options : dict, optional
+            Options for the exp_val_func expectation value function
+
+        noise_model : qiskit.providers.aer.noise.NoiseModel, optional
+            Custom noise model for circuit executions with the qasm simulator backend.
+
+        n_amp_factors : int
+            The number of noise amplification factors to be used. For n number of amplification factors, the specific
+            noise amplification factors will be [1, 3, 5, ..., 2*n - 1]. Larger amounts of noise amplification factors
+            tend to give better results, but slower convergence thus requiring large amounts of shots.
+            Higher noise amplification also increases circuit depth, scaling linearly with the amplification factor c_i,
+            and at some point the circuit depth and the consecutive decoherence will eliminate any further advantage.
+
+        shots: int
+
+
+        pauli_twirl : bool
+
+        pass_manager: qiskit.transpiler.PassManager, optional
+
+        save_results: bool, optional
+
+        experiment_name: string, optional
+
+        option: dict, optional
+
+        """
         """ CONSTRUCTOR
         :param qc: The quantum circuit to be mitigated
         :param exp_val_func: A function that computes the observed expectation value of some operator measured by the
@@ -77,7 +127,6 @@ class ZeroNoiseExtrapolation:
 
         # Max number of shots for one circuit execution on IBMQ devices is 8192.
         # To do more shots, we have to partition them up into several executions.
-        self.shots, self.repeats = None, None
         self.shots, self.repeats = self.partition_shots(shots)
 
         # Do an initial optimization of the quantum circuit. Either with a custom pass manager, or with the
@@ -246,28 +295,34 @@ class ZeroNoiseExtrapolation:
 
         return transpiled_circuit
 
-    def execute_circuits(self, qc: QuantumCircuit, shots=None) -> Result:
+    def execute_circuit(self, qc: QuantumCircuit, shots=None) -> Result:
         """
-        Execute all circuits and return measurement counts. If shots > 8192, we need to partition the execution
-        into several sub-executions.
 
-        Circuits are transpiled and optimized beforehand, thus we pass an empty PassManager to qiskit.execute
-        to avoid unnecessary time spent on transpiling.
+        Parameters
+        ----------
+        qc
+        shots
+
+        Returns
+        -------
+
+        """
+        """
+        Execute a quantum circuit for the specified amount of shots to obtain a set of measurement results.
 
         :param qc: Circuit to be executed
-        :return: A list of count-dictionaries
+        :return: Measurement results as a qiskit.result.result.Result object
         """
 
         if shots == None:
-            repeats = self.repeats
             shots = self.shots
+            repeats = self.repeats
         else:
-            repeats = (shots // 8192) + 1
-            shots = int(shots / repeats)
+            shots, repeats = self.partition_shots(shots)
 
         # The max number of shots on a single execution on the IBMQ devices is 8192.
         # If shots > 8192, we have to partition the execution into several sub-executions.
-        # Note that several circuits can be entered into the IBMQ queue at once by being passed as a list.
+        # Note that several circuits can be entered into the IBMQ queue at once by passing them in a list.
         execution_circuits = [qc.copy() for i in range(repeats)]
 
         # non-simulator backends throws unexpected argument when passing noise_model argument to them
@@ -283,16 +338,25 @@ class ZeroNoiseExtrapolation:
         return circuit_measurement_results
 
     def compute_exp_val(self, result: Result) -> (float, ndarray):
+        """
+
+        Parameters
+        ----------
+        result
+
+        Returns
+        -------
+
+        """
         experiment_exp_vals = zeros(len(result.results))
         for i, experiment_result in enumerate(result.results):
             experiment_exp_vals[i] = self.exp_val_func(experiment_result)
         return average(experiment_exp_vals), experiment_exp_vals
 
-    def mitigate(self, shots=None, verbose: bool = False) -> float:
+    def mitigate(self, verbose: bool = False) -> float:
         """
-        Do the error mitigation for CNOT noise in the given quantum circuit by zero-noise extrapolation.
+        Do error mitigation for general CNOT-noise in the given quantum circuit by zero-noise extrapolation.
 
-        :param repeats: Number of repeats of the extrapolation to perform. The result is averaged over all repeats.
         :param verbose: Do prints during the computation, True / False
         :return: The mitigated expectation value
         """
@@ -340,7 +404,7 @@ class ZeroNoiseExtrapolation:
                         print("Results not found")
 
             if not circuit_read_from_file:
-                circuit_measurement_results = self.execute_circuits(noise_amplified_circuits[i])
+                circuit_measurement_results = self.execute_circuit(noise_amplified_circuits[i])
                 if self.save_results:
                     self.write_to_file(self.experiment_name + "_r{:].results".format(self.noise_amplification_factors[i]),
                                        circuit_measurement_results)
