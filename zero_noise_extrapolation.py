@@ -207,7 +207,7 @@ def Richardson_extrapolate(E, c):
     for k in range(1,n):
         A[k,:] = c**k
     x=np.linalg.solve(A,b)
-    return np.dot(np.transpose(E),x)
+    return np.dot(np.transpose(E),x), x
 
 def mitigate(circuit, amplification_factors,\
              expectationvalue_fun,\
@@ -360,7 +360,7 @@ def mitigate(circuit, amplification_factors,\
     else:
         raise ValueError("not yet implemented, coming soon")
 
-    R=Richardson_extrapolate(E_av.reshape(len(amplification_factors),num_experiments),\
+    R,_=Richardson_extrapolate(E_av.reshape(len(amplification_factors),num_experiments),\
                              np.array(amplification_factors))
 
 

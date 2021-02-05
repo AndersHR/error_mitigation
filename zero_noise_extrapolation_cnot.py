@@ -10,36 +10,43 @@ from qiskit.transpiler.preset_passmanagers.level3 import level_3_pass_manager
 from numpy import asarray, ndarray, shape, zeros, empty, average, transpose, dot
 from numpy.linalg import solve
 
+import random, os, pickle, sys, errno
+
+abs_path = os.path.dirname(__file__)
+sys.path.append(abs_path)
+sys.path.append(os.path.dirname(abs_path))
+
 from zero_noise_extrapolation import Richardson_extrapolate
 
-import random, os, pickle
-
-from typing import Callable
+from typing import Callable, Union
 
 """
 -- ZERO NOISE EXTRAPOLATION for CNOT-gates --
 
-This implemention does quantum error mitigation using the method of zero noise extrapolation, by amplifying noise in
-a quantum circuit by a set of noise amplification factors, then using Richardson extrapolation to extrapolate the
-expectation value to the zero-noise limit.
+This is an implementation of the zero-noise extrapolation technique for quantum error mitigation. The goal is to
+mitigate noise present in a quantum device when evaluating some expectation value that is computed by a quantum circuit
+with subsequent measurements. The main idea of zero-noise extrapolation is to amplify the noise by a set of known
+noise amplification factors, such as to obtain a set of noise amplified expectation values. Richardsson extrapolation
+is then used to extrapolate the expectation value to the zero-noise limit.
 
-The noise amplified and mitigated is specifically noise in CNOT-gates. The noise is amplified by n amplification
-factors c=1, 3, 5, ..., 2n + 1 by repeating each CNOT gates c times. E.g. c=1 corresponds to the bare circuit and
-c=3 corresponds to each CNOT gate replaced by CNOT*CNOT*CNOT. Each CNOT acting on the same control- and target-qubits
-as the original CNOT-gate.
+The noise that is here amplified and mitigated is specifically general noise in CNOT-gates. Note that in modern quantum
+devices the noise in the multi-qubit CNOT-gates tend to be an order of magnitude larger than in single-qubit gates.
 
-As CNOT*CNOT = Id, the identity, in the noise-free case the amplified CNOT (eqaul to CNOT^c) have the same action as a
-single CNOT. In the noise-afflicted case, the action will be close to that of a single CNOT for a weak noise, but with
-the CNOT-noise applied c times to the qubit throughout the process.
+To amplify the noise we use that the CNOT-gate is its own inverse, i.e., CNOT*CNOT = Id, where Id is the identity gate.
+Thus an odd number of CNOT-gates in a series will in the noise-less case have the same action as a single CNOT-gate.
+The noise is amplified by replacing each CNOT-gate in the original bare circuit with a series of (2*i + 1) CNOT's,
+using noise amplification factors c=1, 3, 5, ..., 2*n - 1, for n being the total number of amplification factors.
+For c=3, each CNOT is thus replaced by the sequence CNOT*CNOT*CNOT, and while this has the same action in the noise-less
+case, in the noisy case the noise operation associated with the noisy CNOT-gate will be applied thrice instead of once.
 
 """
 
 
 class ZeroNoiseExtrapolation:
 
-    def __init__(self, qc: QuantumCircuit, exp_val_func: Callable, backend=None, exp_val_options: dict = None,
-                 noise_model: NoiseModel = None, n_amp_factors: int = 3, shots: int = 8192,
-                 pauli_twirl: bool = False,pass_manager: PassManager = None,
+    def __init__(self, qc: QuantumCircuit, exp_val_func: Callable, backend=None, exp_val_option: dict = None,
+                 noise_model: Union[NoiseModel, dict] = None, n_amp_factors: int = 3, shots: int = 8192,
+                 pauli_twirl: bool = False, pass_manager: PassManager = None,
                  save_results: bool = False, experiment_name: str = "", option: dict = None):
         """
         CONSTRUCTOR
@@ -53,16 +60,17 @@ class ZeroNoiseExtrapolation:
 
         exp_val_func : Callable
             A function that computes the desired expectation value based on the measurement results outputted by the
-            quantum circuit. The function should take two arguments: a qiskit.result.result.Result object as its first,
-            and a dictionary with possible options as its second.
+            quantum circuit. The function should take two arguments: a qiskit.result.result.Experiment object as its
+            first argument, and a dictionary with possible options as its second.
 
-        backend :
+        backend : A valid qiskit backend, IBMQ device or simulator
             A qiskit backend, either an IBMQ quantum backend or a simulator backend, for circuit executions.
+            If none is passed, the qasm_simulator will be used.
 
-        exp_val_options : dict, (optional)
+        exp_val_option : dict, (optional)
             Options for the exp_val_func expectation value function
 
-        noise_model : qiskit.providers.aer.noise.NoiseModel, (optional)
+        noise_model : qiskit.providers.aer.noise.NoiseModel or dict, (optional)
             Custom noise model for circuit executions with the qasm simulator backend.
 
         n_amp_factors : int, (default set to 3)
@@ -100,8 +108,8 @@ class ZeroNoiseExtrapolation:
 
         """
 
-        # Set backend for circuit execution
-        if backend == None:
+        # Set backend for circuit execution. If none is passed, use the qasm_simulator backend.
+        if backend is None:
             self.backend = Aer.get_backend("qasm_simulator")
             self.is_simulator = True
         else:
@@ -109,60 +117,78 @@ class ZeroNoiseExtrapolation:
             self.is_simulator = backend.configuration().simulator
 
         self.exp_val_func = exp_val_func
+        self.exp_val_option = exp_val_option
 
         self.noise_model = noise_model
 
         self.n_amp_factors = n_amp_factors
-        self.noise_amplification_factors = asarray([(1 + 2 * i) for i in range(0, n_amp_factors)])
+        self.noise_amplification_factors = asarray([(2*i + 1) for i in range(0, n_amp_factors)])
 
         self.pauli_twirl = pauli_twirl
 
-        # Variables involved in saving of results to disk
-        self.save_results, self.option = save_results, option
-        self.experiment_name = ""
-        self.set_experiment_name(experiment_name)
-        if self.option == None:
-            self.option = {}
-
         # Max number of shots for one circuit execution on IBMQ devices is 8192.
-        # To do more shots, we have to partition them up into several executions.
+        # To do more shots, we have to partition the total experiment into several executions.
         self.shots, self.repeats = self.partition_shots(shots)
 
-        # Do an initial optimization of the quantum circuit. Either with a custom pass manager, or with the
-        # optimization_level=3 transpiler preset (the heaviest optimization preset)
+        # Variables involved in writing and reading results to/from disk
+        self.save_results, self.option = save_results, option
+        if self.option is None:
+            self.option = {}
+        self.experiment_name = ""
+        if self.save_results:
+            self.set_experiment_name(experiment_name)
+            self.create_directory()
+
+        # Initial transpiling of the quantum circuit. If no custom pass manager is passed, the optimization_level=3
+        # qiskit preset (the heaviest optimization preset) will be used. If save_results=True, will attempt to read
+        # the transpiled circuit from disk.
         circuit_read_from_file = False
         if self.save_results:
             qc_from_file = self.read_from_file(self.experiment_name + ".circuit")
-            if qc_from_file != None:
+            if not (qc_from_file is None):
                 circuit_read_from_file = True
                 self.qc = qc_from_file
         if not circuit_read_from_file:
             self.qc = self.transpile_circuit(qc, custom_pass_manager=pass_manager)
 
-        # Initialization of variables for later use:
+        """
+            Initialization of other variables for later use:
+        """
 
         self.counts = []
 
         self.depths, self.gamma_factors = empty(n_amp_factors), empty(n_amp_factors)
 
-        self.exp_vals = zeros(0)
+        # Will store expectation values for each individual circuit execution
         self.all_exp_vals = zeros(0)
+        # Will store expectation values for each noise amplified circuit, averaged over all sub-executions
         self.noise_amplified_exp_vals = zeros(0)
 
         self.result = None
 
         self.measurement_results = []
 
-    def partition_shots(self, shots: int) -> (int, int):
+    def partition_shots(self, tot_shots: int) -> (int, int):
         """
         IBMQ devices limits circuit executions to a max of 8192 shots per experiment. To perform more than 8192 shots,
-        the experiment has to be repeated.
-        :param shots: Total number of shots of the circuit to be executed
+        the experiment has to be repeated. Therefore, if shots > 8192, we partition the execution into several repeats
+        of less than 8192 shots each.
+
+        Parameters
+        ----------
+        tot_shots : int
+            The total number of circuit execution shots.
+
+        Returns
+        -------
+        shots, repeats: (int, int)
+            Shots per repeat, number of repeats
         """
-        if shots <= 8192:
-            return shots, 1
+        if tot_shots <= 8192:
+            return tot_shots, 1
         else:
-            return int(shots / self.repeats), (shots // 8192) + 1
+            repeats = (tot_shots // 8192) + 1
+            return int(tot_shots / repeats), repeats
 
     def set_shots(self, shots: int):
         self.shots, self.repeats = self.partition_shots(shots)
@@ -171,16 +197,57 @@ class ZeroNoiseExtrapolation:
         return self.repeats * self.shots
 
     def set_experiment_name(self, experiment_name):
-        if self.save_results:
-            if experiment_name == "":
-                raise Exception("experiment_name cannot be empty when saving results")
-            self.experiment_name = experiment_name
-            self.experiment_name += "_ZNE_CNOTrep"
-            self.experiment_name += "_backend" + self.backend.name()
-            self.experiment_name += "_shots" + str(self.get_shots())
-            self.experiment_name += "_paulitwirling" + str(self.pauli_twirl)
+        """
+        Construct the experiment name that will form the base for the filenames that will be read from / written to
+        when save_results=True. The full experiment name will contain information about the backend, number of shots,
+        and pauli twirling, to ensure that different experiments using different parameters don't read from the same
+        data.
+
+        Parameters
+        ----------
+        experiment_name : str
+            The base for the experiment name that will be used for filenames
+
+        """
+        if self.save_results and experiment_name == "":
+            raise Exception("experiment_name cannot be empty when writing/reading results from disk is activated")
+        self.experiment_name = experiment_name
+        self.experiment_name += "__ZNE_CNOT_REP_"
+        self.experiment_name += "_backend" + self.backend.name()
+        self.experiment_name += "_shots" + str(self.get_shots())
+        self.experiment_name += "_paulitwirling" + str(self.pauli_twirl)
+
+    def create_directory(self):
+        """
+        Attempt to create the directory in which to read from/write to files. The case whereby the directory already
+        exists is handled by expection handling.
+
+        The directory is given by self.option["directory"], with the default being "results".
+
+        """
+        if not self.save_results:
+            return
+        directory = self.option.get("directory", "results")
+        try:
+            os.makedirs(directory)
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise e
 
     def read_from_file(self, filename: str):
+        """
+        Attempts to read data for a given filename, looking in the directory given by self.option["directory"].
+
+        Parameters
+        ----------
+        filename : str
+            The full filename for the file in question
+
+        Returns
+        -------
+        data : any
+            The data read from said file. None if the file wasn't found
+        """
         directory = self.option.get("directory", "results")
         if os.path.isfile(directory + "/" + filename):
             file = open(directory + "/" + filename, "rb")
@@ -191,9 +258,21 @@ class ZeroNoiseExtrapolation:
             return None
 
     def write_to_file(self, filename: str, data):
+        """
+        Writes data to file with given filename, located in the directory given by self.option["directory"].
+
+        Parameters
+        ----------
+        filename : str
+            The full filename of the file to be written to.
+        data : any
+            The data to be stored.
+
+        """
         directory = self.option.get("directory", "results")
-        file = open(directory + "/" + filename)
+        file = open(directory + "/" + filename, "wb")
         pickle.dump(data, file)
+        file.close()
 
     def noise_amplify_and_pauli_twirl_cnots(self, qc: QuantumCircuit, amp_factor: int,
                                             pauli_twirl: bool) -> QuantumCircuit:
@@ -257,9 +336,9 @@ class ZeroNoiseExtrapolation:
 
     def transpile_circuit(self, qc: QuantumCircuit, custom_pass_manager: PassManager = None) -> QuantumCircuit:
         """
-        Transpile and optimize the input circuit, optionally using a custom pass manager.
-        If no custom pass manager is given, use the optimization_level 3 preset for the qiskit transpiler,
-        which gives heaviest circuit optimization.
+        Transpile and optimize the input circuit, optionally by  using a custom pass manager.
+        If no custom pass manager is given, the optimization_level = 3 preset for the qiskit transpiler,
+        the heaviest optimization preset, will be used.
 
         As we want to add additional CNOTs for noise amplification and possibly additional single qubit gates
         for Pauli twirling, we need to transpile the circuit before both the noise amplification is applied and
@@ -269,7 +348,17 @@ class ZeroNoiseExtrapolation:
         the Pauli-twirling, as well as the Unroller pass which merely decomposes the given circuit gates into
         the given set of basis gates.
 
-        :return: The transpiled circuit
+        Parameters
+        ----------
+        qc : qiskit.QuantumCircuit
+            The original bare quantum circuit.
+        custom_pass_manager : qiskit.transpiler.PassManager, (optional)
+            A custom pass manager to be used in transpiling.
+
+        Returns
+        -------
+        transpiled_circuit : qiskit.QuantumCircuit
+            The transpiled quantum circuit.
         """
 
         if custom_pass_manager == None:
@@ -286,8 +375,8 @@ class ZeroNoiseExtrapolation:
 
         transpiled_circuit = pass_manager.run(qc)
 
-        # As there is some randomness involved in the qiskit transpiling, we might want to save
-        # the specific transpiled circuit that is used
+        # As there is some randomness involved in the qiskit transpiling we might want to save
+        # the specific transpiled circuit that is used in order to access it later.
         if self.save_results:
             filename = self.experiment_name + ".circuit"
             self.write_to_file(filename, transpiled_circuit)
@@ -299,21 +388,17 @@ class ZeroNoiseExtrapolation:
 
         Parameters
         ----------
-        qc
-        shots
-
+        qc : qiskit.QuantumCircuit
+            The specific quantum circuit to be executed.
+        shots : int, (optional)
+            The number of shots of the circuit execution. If none is passed, self.shots is used.
         Returns
         -------
-
-        """
-        """
-        Execute a quantum circuit for the specified amount of shots to obtain a set of measurement results.
-
-        :param qc: Circuit to be executed
-        :return: Measurement results as a qiskit.result.result.Result object
+        circuit_measurement_results : qiskit.result.result.Result
+            A Result object containing the data and measurement results for the circuit executions.
         """
 
-        if shots == None:
+        if shots is None:
             shots = self.shots
             repeats = self.repeats
         else:
@@ -341,23 +426,32 @@ class ZeroNoiseExtrapolation:
 
         Parameters
         ----------
-        result
-
+        result : qiskit.result.result.Result
+            A qiskit Result object containing all measurement results from a set of quantum circuit executions.
         Returns
         -------
-
+        averaged_experiment_exp_vals, experiment_exp_vals : Tuple[float, ndarray]
+            The final experiment expectation value, averaged over all circuit sub-executions, and a numpy array
+            containing the expectation values for each circuit sub-execution.
         """
         experiment_exp_vals = zeros(len(result.results))
         for i, experiment_result in enumerate(result.results):
-            experiment_exp_vals[i] = self.exp_val_func(experiment_result)
+            experiment_exp_vals[i] = self.exp_val_func(experiment_result, self.exp_val_option)
         return average(experiment_exp_vals), experiment_exp_vals
 
     def mitigate(self, verbose: bool = False) -> float:
         """
-        Do error mitigation for general CNOT-noise in the given quantum circuit by zero-noise extrapolation.
+        Perform the quantum error mitigation.
 
-        :param verbose: Do prints during the computation, True / False
-        :return: The mitigated expectation value
+        Parameters
+        ----------
+        verbose : bool
+            Do prints throughout the computation.
+
+        Returns
+        -------
+        result : float
+            The mitigated expectation value.
         """
 
         n_amp_factors = shape(self.noise_amplification_factors)[0]
@@ -372,7 +466,7 @@ class ZeroNoiseExtrapolation:
                   "\nNoise amplification factors=", self.noise_amplification_factors, sep="")
 
         if verbose:
-            print("Constructing circuits")
+            print("-----\nConstructing circuits")
 
         noise_amplified_circuits = []
 
@@ -384,7 +478,7 @@ class ZeroNoiseExtrapolation:
         if verbose:
             print("Depths=", self.depths, sep="")
 
-            print("Executing circuits")
+            print("-----\nExecuting circuits")
 
         for i in range(n_amp_factors):
             print("Noise amplification factor ", i + 1, " of ", n_amp_factors)
@@ -402,10 +496,14 @@ class ZeroNoiseExtrapolation:
                     if verbose:
                         print("Results not found")
 
+            # circuit_read_from_file equals False if either the option for reading from/writing to disk is off, e.g.,
+            # if save_results=Flase, or if the result was attempted to be read but not found.
+            # In either case the experiment must be run from scratch.
             if not circuit_read_from_file:
                 circuit_measurement_results = self.execute_circuit(noise_amplified_circuits[i])
                 if self.save_results:
-                    self.write_to_file(self.experiment_name + "_r{:].results".format(self.noise_amplification_factors[i]),
+                    # Write the noise amplified expectation value to disk
+                    self.write_to_file(self.experiment_name + "_r{:}.results".format(self.noise_amplification_factors[i]),
                                        circuit_measurement_results)
 
             self.noise_amplified_exp_vals[i], self.all_exp_vals[i, :] = self.compute_exp_val(
@@ -413,11 +511,14 @@ class ZeroNoiseExtrapolation:
 
             self.measurement_results.append(circuit_measurement_results)
 
-        self.result = Richardson_extrapolate(self.noise_amplified_exp_vals, self.noise_amplification_factors)[0]
+        # Find the mitigated expectation value by Richardson extrapolation
+        result,_ = Richardson_extrapolate(self.noise_amplified_exp_vals, self.noise_amplification_factors)
+        self.result = result[0]
 
         if verbose:
             print("-----", "\nError mitigation done",
                   "\nBare circuit expectation value: ", self.noise_amplified_exp_vals[0],
+                  "\nNoise amplified expectation values: ",self.noise_amplified_exp_vals,
                   "\nMitigated expectation value:", self.result, "\n-----", sep="")
 
         return self.result
@@ -431,10 +532,17 @@ PHYSICAL_GATE_CONVERSION = {"X": "u3(pi,0,pi)", "Z": "u1(pi)", "Y": "u3(pi,pi/2,
 
 def find_qreg_name(circuit_qasm: str) -> str:
     """
-    Finds the name of the quantum register in the circuit.
+    Finds the name of the quantum register in the circuit. Assumes a single quantum register.
 
-    :param circuit_qasm: OpenQASM string with instructions for the entire circuit
-    :return: Name of the quantum register
+    Parameters
+    ----------
+    circuit_qasm : str
+        The OpenQASM-string for the circuit
+
+    Returns
+    -------
+    qreg_name :str
+        The name of the quantum register
     """
     for line in circuit_qasm.splitlines():
         if line[0:5] == "qreg ":
@@ -449,10 +557,17 @@ def find_qreg_name(circuit_qasm: str) -> str:
 
 def find_cnot_control_and_target(qasm_line: str) -> (int, int):
     """
-    Find indices of control and target qubits for the CNOT-gate in question
+    Find the indices of the control and target qubits for a specific CNOT-gate.
 
-    :param qasm_line: OpenQASM line containing the CNOT
-    :return: Indices of control and target qubits
+    Parameters
+    ----------
+    qasm_line : str
+        The line containing the CNOT-gate in question taken from the OpenQASM-format string of the quantum circuit.
+
+    Returns
+    -------
+    control, target : Tuple[int, int]
+        qubit indices for control and target qubits
     """
     qubits = []
     for i, c in enumerate(qasm_line):
@@ -479,9 +594,16 @@ def propagate(control_in: str, target_in: str):
     Note that instead of Pauli-twirling with [X,Z,Y] we use [X,Z,XZ] where XZ = -i*Y.
     The inverse of XZ is ZX = -XZ = i*Y. The factors of plus minus i are global phase factors which can be ignored.
 
-    :param control_in: Pauli gates on control qubit before CNOT
-    :param target_in: Pauli gates on target qubit before CNOT
-    :return: Equivalent Pauli gates on control and target qubits after CNOT
+    Parameters
+    ----------
+    control_in : str
+        The Pauli operator on control qubit before the CNOT, i.e., a
+    target_in : str
+        The Pauli operator on target qubit before the CNOT, i.e., b
+    Returns
+    -------
+    control_out, target_out : Tuple[str, str]
+        The operators c and d such that (a x b) CNOT (c x d) = CNOT
     """
 
     control_out, target_out = '', ''
@@ -520,6 +642,20 @@ def propagate(control_in: str, target_in: str):
 
 def apply_qasm_pauli_gate(qreg_name: str, qubit: int, pauli_gates: str):
     """
+
+
+    Parameters
+    ----------
+    qreg_name :str
+    qubit : int
+    pauli_gates : str
+
+    Returns
+    -------
+
+    """
+
+    """
     Construct a OpenQASM-string with the instruction to apply the given pauli gates to
     the given qubit
 
@@ -537,6 +673,17 @@ def apply_qasm_pauli_gate(qreg_name: str, qubit: int, pauli_gates: str):
 
 
 def pauli_twirl_cnot_gate(qreg_name: str, qasm_line_cnot: str) -> str:
+    """
+
+    Parameters
+    ----------
+    qreg_name
+    qasm_line_cnot
+
+    Returns
+    -------
+
+    """
     """
     Pauli-twirl a CNOT-gate from the given OpenQASM string line containing the CNOT.
     This will look something like: cx q[0],q[1];
@@ -569,6 +716,16 @@ def pauli_twirl_cnot_gate(qreg_name: str, qasm_line_cnot: str) -> str:
 
 
 def pauli_twirl_cnots(qc: QuantumCircuit) -> QuantumCircuit:
+    """
+
+    Parameters
+    ----------
+    qc
+
+    Returns
+    -------
+
+    """
     """
     General function for Pauli-twirling all CNOT-gates in a quantum circuit.
     Included for completeness.
