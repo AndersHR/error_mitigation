@@ -642,31 +642,26 @@ def propagate(control_in: str, target_in: str):
 
 def apply_qasm_pauli_gate(qreg_name: str, qubit: int, pauli_gates: str):
     """
-
+    Construct an OpenQASM-string line with the given Pauli-gates applid to the given qubit.
 
     Parameters
     ----------
     qreg_name :str
+        The name of the qiskit.QuantumRegister containing the qubit.
     qubit : int
+        The index of the qubit.
     pauli_gates : str
-
+        A string determining the Pauli-gates to be applied. Must be a sequence the characters I, X, Y and/or Z.
     Returns
     -------
-
-    """
-
-    """
-    Construct a OpenQASM-string with the instruction to apply the given pauli gates to
-    the given qubit
-
-    :param qreg_name: Name of quantum register
-    :param qubit: Index of qubit
-    :param pauli_gates: The Pauli gates to be applied
-    :return: The OpenQASM-string with the instruction
+    new_qasm_line : str
+        An OpenQASM string with the Pauli-gates applied to the qubit.
     """
     new_qasm_line = ''
     for gate in pauli_gates:
         if gate != 'I':
+            if gate not in PHYSICAL_GATE_CONVERSION.keys():
+                raise Exception("Invalid Pauli-gate used in Pauli-twirl: {:}".format(gate))
             u_gate = PHYSICAL_GATE_CONVERSION[gate]
             new_qasm_line += u_gate + ' ' + qreg_name + '[' + str(qubit) + '];' + '\n'
     return new_qasm_line
@@ -674,24 +669,28 @@ def apply_qasm_pauli_gate(qreg_name: str, qubit: int, pauli_gates: str):
 
 def pauli_twirl_cnot_gate(qreg_name: str, qasm_line_cnot: str) -> str:
     """
+    Pauli-twirl a specific CNOT-gate. This involves drawing two random Pauli-gates a and b, picked from the single-qubit
+    Pauli set {Id, X, Y, Z}, then determining the corresponding two Pauli-gates c and d such that
+    (a x b) * CNOT * (c x d) = CNOT, for an ideal CNOT.
+
+    The original CNOT gates is then replaced by the gate ((a x b) * CNOT * (c x d)). This transforms the noise in the
+    CNOT-gate into stochastic Pauli-type noise. An underlying assumption is that the noise in the single-qubit Pauli
+    gates is negligible to the noise in the CNOT-gates.
 
     Parameters
     ----------
-    qreg_name
-    qasm_line_cnot
+    qreg_name : str
+        The name of the qiskit.QuantumRegister for the qubits in question.
+    qasm_line_cnot : str
+        The OpenQASM-string line containing the CNOT-gate.
 
     Returns
     -------
+    new_qasm_line : str
+        A new OpenQASM-string section to replace the aforementioned OpenQASM line containing the CNOT-gate, where not
+        the CNOT-gate has been Pauli-twirled.
+    """
 
-    """
-    """
-    Pauli-twirl a CNOT-gate from the given OpenQASM string line containing the CNOT.
-    This will look something like: cx q[0],q[1];
-
-    :param qreg_name: Name of quantum register
-    :param qasm_line_cnot: OpenQASM-line containing the CNOT to pauli twirl
-    :return:
-    """
     control, target = find_cnot_control_and_target(qasm_line_cnot)
 
     # Note: XZ = -i*Y, with inverse (XZ)^-1 = ZX = i*Y. This simplifies the propagation of gates a,b over the CNOT
@@ -717,21 +716,18 @@ def pauli_twirl_cnot_gate(qreg_name: str, qasm_line_cnot: str) -> str:
 
 def pauli_twirl_cnots(qc: QuantumCircuit) -> QuantumCircuit:
     """
+    Pauli-twirl all CNOT-gates in a general quantum circuit. This function is included here for completeness.
+
 
     Parameters
     ----------
-    qc
+    qc : qiskit.QuantumCircuit
+        The original quantum circuit.
 
     Returns
     -------
-
-    """
-    """
-    General function for Pauli-twirling all CNOT-gates in a quantum circuit.
-    Included for completeness.
-
-    :param qc: quantum circuit for which to Pauli twirl all CNOT gates
-    :return: Pauli twirled quantum circuit
+    pauli_twirled_qc : qiskit.QuantumCircuit
+        The quantum circuit where all CNOT-gates have been Pauli-twirled.
     """
 
     # The circuit may be expressed in terms of various types of gates.
