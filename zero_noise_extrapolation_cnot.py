@@ -60,7 +60,7 @@ class ZeroNoiseExtrapolation:
         exp_val_func : Callable
             A function that computes the desired expectation value based on the measurement results outputted by the
             quantum circuit.
-            The function should take two arguments: a list of qiskit.result.result.Experiment objects as its first
+            The function should take two arguments: a list of qiskit.result.result.ExperimentResult objects as its first
             argument, and a possible filter as its second.
             The function should return: An array
 
@@ -285,7 +285,11 @@ class ZeroNoiseExtrapolation:
 
         Using CNOT*CNOT = I, the identity, and an amp_factor = (2*n + 1) for an integer n, then the
         extended CNOT will have the same action as a single CNOT, but with the noise amplified by
-        a factor amp_factor.
+        a factor amp_factor. This thus method allows for circuit-level noise amplification.
+
+        For efficiency, this function does both noise amplification and pauli twirling (optionally) at the same time.
+        Separate functions for noise amplification and for pauli twirling are included at the end of this file, for
+        completeness.
 
         :param qc: Quantum circuit for which to Pauli twirl all CNOT gates and amplify CNOT-noise
         :param amp_factor: The noise amplification factor, must be (2n + 1) for n = 0,1,2,3,...
@@ -751,7 +755,6 @@ def pauli_twirl_cnots(qc: QuantumCircuit) -> QuantumCircuit:
     """
     Pauli-twirl all CNOT-gates in a general quantum circuit. This function is included here for completeness.
 
-
     Parameters
     ----------
     qc : qiskit.QuantumCircuit
@@ -794,3 +797,53 @@ def pauli_twirl_cnots(qc: QuantumCircuit) -> QuantumCircuit:
     pm = PassManager(optimize1qates)
 
     return pm.run(new_qc)
+
+def noise_amplify_cnots(qc: QuantumCircuit, amp_factor: int):
+    """
+    Noise amplify all CNOT-gates in the given QuantumCircuit by expanding each CNOT-gate as CNOT -> CNOT^a, where a is
+    the noise amplification factor, a = 2*n - 1. Included here for completeness.
+
+    Parameters
+    ----------
+    qc: qiskit.QuantumCircuit
+        Quantum circuit to be noise amplified
+    amp_factor:
+        The noise amplification factor. Must be odd
+    Returns
+    -------
+    noise_amplified_qc: qiskit.QuantumCircuit
+        The noise amplified circuit
+    """
+
+    if (amp_factor - 1) % 2 != 0:
+        raise Exception("Invalid amplification factors", amp_factor)
+
+    # The circuit may be expressed in terms of various types of gates.
+    # The 'Unroller' transpiler pass 'unrolls' (decomposes) the circuit gates to be expressed in terms of the
+    # physical gate set [u1,u2,u3,cx]
+
+    # The cz, cy (controlled-Z and -Y) gates can be constructed from a single cx-gate and single-qubit gates.
+    # For backends with native gate sets consisting of some set of single-qubit gates and either the cx, cz or cy,
+    # unrolling the circuit to the ["u3", "cx"] basis, amplifying the cx-gates, then unrolling back to the native
+    # gate set and doing a single-qubit optimization transpiler pass, is thus still general.
+
+    unroller_ugatesandcx = Unroller(["u1", "u2", "u3", "cx"])
+    pm = PassManager(unroller_ugatesandcx)
+
+    unrolled_qc = pm.run(qc)
+
+    circuit_qasm = unrolled_qc.qasm()
+    new_circuit_qasm_str = ""
+
+    qreg_name = find_qreg_name(circuit_qasm)
+
+    for i, line in enumerate(circuit_qasm.splitlines()):
+        if line[0:2] == "cx":
+            for j in range(amp_factor):
+                new_circuit_qasm_str += pauli_twirl_cnot_gate(qreg_name, line)
+        else:
+            new_circuit_qasm_str += line + "\n"
+
+    new_qc = QuantumCircuit.from_qasm_str(new_circuit_qasm_str)
+
+    return new_qc
