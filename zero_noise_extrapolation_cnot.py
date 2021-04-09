@@ -10,6 +10,7 @@ from qiskit.transpiler.preset_passmanagers.level3 import level_3_pass_manager
 from numpy import asarray, ndarray, shape, zeros, empty, average
 
 import random, os, pickle, sys, errno
+from dataclasses import dataclass
 
 abs_path = os.path.dirname(__file__)
 sys.path.append(abs_path)
@@ -41,6 +42,27 @@ case, in the noisy case the noise operation associated with the noisy CNOT-gate 
 """
 
 
+# Dataclasses:
+
+@dataclass(frozen=True)
+class NoiseAmplifiedResult:
+    amplification_factor: int
+    exp_val: float
+    circuit: QuantumCircuit
+    depth: int
+    shots: int
+
+
+@dataclass(frozen=True)
+class ZeroNoiseExtrapolationResult:
+    result: float
+    circuit: QuantumCircuit
+    all_exp_vals: ndarray
+    noise_amplified_exp_vals: ndarray
+    depths: ndarray
+
+
+# Zero-noise extrapolation class:
 class ZeroNoiseExtrapolation:
 
     def __init__(self, qc: QuantumCircuit, exp_val_func: Callable, backend=None, exp_val_filter=None,
@@ -62,7 +84,7 @@ class ZeroNoiseExtrapolation:
             quantum circuit.
             The function should take two arguments: a list of qiskit.result.result.ExperimentResult objects as its first
             argument, and a possible filter as its second.
-            The function should return: An array
+            The function should return: An array of computed expectation values
 
         backend : A valid qiskit backend, IBMQ device or simulator
             A qiskit backend, either an IBMQ quantum backend or a simulator backend, for circuit executions.
@@ -162,8 +184,9 @@ class ZeroNoiseExtrapolation:
 
         # Will store expectation values for each individual circuit execution
         self.all_exp_vals = zeros(0)
-        # Will store expectation values for each noise amplified circuit, averaged over all sub-executions
+        # Will store expectation values and variances from the execution of each noise amplified circuit
         self.noise_amplified_exp_vals = zeros(0)
+        self.noise_amplified_variances = zeros(0)
 
         self.result = None
 
@@ -172,8 +195,8 @@ class ZeroNoiseExtrapolation:
     def partition_shots(self, tot_shots: int) -> (int, int):
         """
         IBMQ devices limits circuit executions to a max of 8192 shots per experiment. To perform more than 8192 shots,
-        the experiment has to be repeated. Therefore, if shots > 8192, we partition the execution into several repeats
-        of less than 8192 shots each.
+        the experiment has to be partitioned into a set of circuit executions, each with less than 8192 shots.
+        Therefore, if shots > 8192, we partition the execution into several repeats of less than 8192 shots each.
 
         Parameters
         ----------
@@ -304,7 +327,7 @@ class ZeroNoiseExtrapolation:
         # The 'Unroller' transpiler pass 'unrolls' (decomposes) the circuit gates to be expressed in terms of the
         # physical gate set [u1,u2,u3,cx]
 
-        # The cz, cy (controlled-Z and -Y) gates can be constructed from a single cx-gate and sinlge-qubit gates.
+        # The cz, cy (controlled-Z and -Y) gates can be constructed from a single cx-gate and single-qubit gates.
         # For backends with native gate sets consisting of some set of single-qubit gates and either the cx, cz or cy,
         # unrolling the circuit to the ["u3", "cx"] basis, amplifying the cx-gates, then unrolling back to the native
         # gate set and doing a single-qubit optimization transpiler pass, is thus still general.
@@ -369,7 +392,7 @@ class ZeroNoiseExtrapolation:
             The transpiled quantum circuit.
         """
 
-        if custom_pass_manager == None:
+        if custom_pass_manager is None:
             pass_manager_config = PassManagerConfig(basis_gates=["id", "u1", "u2", "u3", "cx"],
                                                     backend_properties=self.backend.properties())
             if not self.is_simulator:
@@ -393,6 +416,9 @@ class ZeroNoiseExtrapolation:
 
     def execute_circuit(self, qc: QuantumCircuit, shots=None) -> Result:
         """
+        Execute a single experiment consisting of the execution of a quantum circuit over a specified number of shots.
+        One experiment may need to be partitioned into a set of several identical circuit executions. This is due to the
+        IBMQ quantum devices limiting circuit executions to a maximum of 8192 shots per.
 
         Parameters
         ----------
@@ -429,28 +455,51 @@ class ZeroNoiseExtrapolation:
 
         return circuit_measurement_results
 
-    def compute_exp_val(self, result: Result) -> (float, ndarray):
+    def compute_exp_val(self, result: Result) -> (float, float, ndarray):
         """
-        Compute the expectation value for
+        Compute the expectation value and variance for a set of circuit executions. We assume that all separate circuit
+        execution was run with the same number of shots.
 
         Parameters
         ----------
         result : qiskit.result.result.Result
             A qiskit Result object containing all measurement results from a set of quantum circuit executions.
+
         Returns
         -------
-        averaged_experiment_exp_vals, experiment_exp_vals : Tuple[float, numpy.ndarray]
-            The final experiment expectation value, averaged over all circuit sub-executions, and a numpy array
-            containing the expectation values for each circuit sub-execution.
+        averaged_experiment_exp_vals, averaged_experiment_variances experiment_exp_vals : Tuple[float, numpy.ndarray]
+            The final estimated experiment expectation value and variance, averaged over all circuit sub-executions,
+            and a numpy array containing the expectation values for each circuit sub-execution.
         """
 
         experiment_results = result.results
 
-        experiment_exp_vals = self.exp_val_func(experiment_results, self.exp_val_filter)
+        experiment_exp_vals, experiment_variances = self.exp_val_func(experiment_results, self.exp_val_filter)
 
-        return average(experiment_exp_vals), asarray(experiment_exp_vals)
+        return average(experiment_exp_vals), average(experiment_variances), asarray(experiment_exp_vals)
+
+    def compute_noise_amplified_exp_val(self):
+        return
+
+    def sample_error(self):
+        return
 
     def extrapolate(self, n_amp_factors: int = None, noise_amplified_exp_vals: ndarray = None) -> float:
+        """
+        Perform the extrapolation step of the zero-noise extrapolation.
+
+        Parameters
+        ----------
+        n_amp_factors: int
+            The number of amplification factors used.
+        noise_amplified_exp_vals:
+            The noise amplified expectation value from which to extrapolate to the zero-noise case
+
+        Returns
+        -------
+        result: float
+            The resulting mitigated expectation value.
+        """
         if noise_amplified_exp_vals is None:
             noise_amplified_exp_vals = self.noise_amplified_exp_vals
         if n_amp_factors is None:
@@ -488,6 +537,7 @@ class ZeroNoiseExtrapolation:
         n_amp_factors = shape(self.noise_amplification_factors)[0]
 
         self.noise_amplified_exp_vals = zeros((n_amp_factors,))
+        self.noise_amplified_variances = zeros((n_amp_factors,))
         self.all_exp_vals = zeros((n_amp_factors, self.repeats))
 
         if verbose:
@@ -541,8 +591,8 @@ class ZeroNoiseExtrapolation:
                     if verbose:
                         print("Results successfully written to disk.")
 
-            self.noise_amplified_exp_vals[i], self.all_exp_vals[i, :] = self.compute_exp_val(
-                circuit_measurement_results)
+            self.noise_amplified_exp_vals[i], self.noise_amplified_variances[i], self.all_exp_vals[i, :] \
+                = self.compute_exp_val(circuit_measurement_results)
 
             self.measurement_results.append(circuit_measurement_results)
 
@@ -827,7 +877,7 @@ def noise_amplify_cnots(qc: QuantumCircuit, amp_factor: int):
     # unrolling the circuit to the ["u3", "cx"] basis, amplifying the cx-gates, then unrolling back to the native
     # gate set and doing a single-qubit optimization transpiler pass, is thus still general.
 
-    unroller_ugatesandcx = Unroller(["u1", "u2", "u3", "cx"])
+    unroller_ugatesandcx = Unroller(["u", "cx"])
     pm = PassManager(unroller_ugatesandcx)
 
     unrolled_qc = pm.run(qc)
@@ -835,12 +885,12 @@ def noise_amplify_cnots(qc: QuantumCircuit, amp_factor: int):
     circuit_qasm = unrolled_qc.qasm()
     new_circuit_qasm_str = ""
 
-    qreg_name = find_qreg_name(circuit_qasm)
+    # qreg_name = find_qreg_name(circuit_qasm)
 
     for i, line in enumerate(circuit_qasm.splitlines()):
         if line[0:2] == "cx":
             for j in range(amp_factor):
-                new_circuit_qasm_str += pauli_twirl_cnot_gate(qreg_name, line)
+                new_circuit_qasm_str += line + "\n"
         else:
             new_circuit_qasm_str += line + "\n"
 
