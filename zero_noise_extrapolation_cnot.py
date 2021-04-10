@@ -7,7 +7,7 @@ from qiskit.transpiler import PassManager, PassManagerConfig, CouplingMap
 from qiskit.transpiler.passes import Unroller, Optimize1qGates
 from qiskit.transpiler.preset_passmanagers.level3 import level_3_pass_manager
 
-from numpy import asarray, ndarray, shape, zeros, empty, average, transpose, dot
+from numpy import asarray, ndarray, shape, zeros, empty, average, transpose, dot, sqrt
 from numpy.linalg import solve
 
 import random, os, pickle, sys, errno
@@ -58,9 +58,9 @@ class NoiseAmplifiedResult:
 @dataclass(frozen=True)
 class ZeroNoiseExtrapolationResult:
     qc: QuantumCircuit
-    noise_amplified_results: ndarray[NoiseAmplifiedResult]
-    noise_amplification_factors: ndarray[int]
-    gamma_coefficients: ndarray[float]
+    noise_amplified_results: ndarray
+    noise_amplification_factors: ndarray
+    gamma_coefficients: ndarray
     exp_val: float
 
     def get_bare_exp_val(self) -> float:
@@ -86,7 +86,7 @@ class ZeroNoiseExtrapolation:
                  noise_model: Union[NoiseModel, dict] = None, n_amp_factors: int = 3, shots: int = 8192,
                  pauli_twirl: bool = False, pass_manager: PassManager = None,
                  save_results: bool = False, experiment_name: str = "", option: dict = None,
-                 error_controlled_sampling: bool = False, max_shots: int = 100*8192, error_tol: float = 0.01):
+                 error_controlled_sampling: bool = False, max_shots: int = 2048*8192, error_tol: float = 0.01):
         """
         CONSTRUCTOR
 
@@ -169,9 +169,13 @@ class ZeroNoiseExtrapolation:
 
         self.pauli_twirl = pauli_twirl
 
-        # Max number of shots for one circuit execution on IBMQ devices is 8192.
-        # To do more shots, we have to partition the total experiment into several executions.
-        self.shots, self.repeats = self.partition_shots(shots)
+        # Total number of shots
+        self.shots = shots
+
+        # variables involved in error controlled sampling:
+        self.error_controlled_sampling = error_controlled_sampling
+        self.max_shots = max_shots
+        self.error_tol = error_tol
 
         # Variables involved in writing and reading results to/from disk
         self.save_results, self.option = save_results, option
@@ -194,24 +198,9 @@ class ZeroNoiseExtrapolation:
         if not circuit_read_from_file:
             self.qc = self.transpile_circuit(qc, custom_pass_manager=pass_manager)
 
-        # variables involved in error controlled sampling:
-        self.error_controlled_sampling = error_controlled_sampling
-        self.max_shots = max_shots
-        self.error_tol = error_tol
-
         """
         --- Initialization of other variables for later use:
         """
-
-        self.counts = []
-
-        self.depths, self.gamma_factors = empty(n_amp_factors), empty(n_amp_factors)
-
-        # Will store expectation values for each individual circuit execution
-        self.all_exp_vals = zeros(0)
-        # Will store expectation values and variances from the execution of each noise amplified circuit
-        self.noise_amplified_exp_vals = zeros(0)
-        self.noise_amplified_variances = zeros(0)
 
         self.noise_amplified_results = empty((self.n_amp_factors,), dtype=NoiseAmplifiedResult)
 
@@ -219,12 +208,8 @@ class ZeroNoiseExtrapolation:
 
         self.mitigated_exp_val = None
 
-        self.measurement_results = []
-
-    def __repr__(self):
-        pass
-
-    def partition_shots(self, tot_shots: int) -> (int, int):
+    @staticmethod
+    def partition_shots(tot_shots: int) -> (int, int):
         """
         IBMQ devices limits circuit executions to a max of 8192 shots per experiment. To perform more than 8192 shots,
         the experiment has to be partitioned into a set of circuit executions, each with less than 8192 shots.
@@ -249,14 +234,12 @@ class ZeroNoiseExtrapolation:
                 repeats = (tot_shots // 8192) + 1
             return int(tot_shots / repeats), repeats
 
-    def set_shots(self, shots: int):
-        self.shots, self.repeats = self.partition_shots(shots)
+    # Useful set and get functions:
 
-    def get_shots(self):
-        return self.repeats * self.shots
-
-    def get_noise_amplified_exp_vals(self):
+    def get_noise_amplified_exp_vals(self) -> ndarray:
         return asarray([result.exp_val for result in self.noise_amplified_results])
+
+    # Error mitigation help functions:
 
     def compute_extrapolation_coefficients(self, n_amp_factors: int = None) -> ndarray:
         if n_amp_factors is None:
@@ -266,8 +249,9 @@ class ZeroNoiseExtrapolation:
 
         amplification_factors = asarray([2*i + 1 for i in range(n_amp_factors)])
 
-        A = zeros((n_amp_factors, n_amp_factors))
-        b = zeros((n_amp_factors, 1))
+        A, b = zeros((n_amp_factors, n_amp_factors)), zeros((n_amp_factors, 1))
+
+        A[0,:], b[0] = 1, 1
 
         for k in range(1, n_amp_factors):
             A[k, :] = amplification_factors**k
@@ -279,10 +263,10 @@ class ZeroNoiseExtrapolation:
     def extrapolate(self, noise_amplified_exp_vals: ndarray):
         if self.n_amp_factors == 1:
             return noise_amplified_exp_vals[0]
-        if not shape(noise_amplified_exp_vals) == shape(self.gamma_coefficients):
+        if not shape(noise_amplified_exp_vals)[0] == shape(self.gamma_coefficients)[0]:
             raise Exception("Shape mismatch between noise_amplified_exp_vals and gamma_coefficients." +
-                            " Shape={:}".format(shape(noise_amplified_exp_vals)) +
-                            " does not match shape={:}".format(shape(self.gamma_coefficients)))
+                            " length={:}".format(shape(noise_amplified_exp_vals)[0]) +
+                            " does not match length={:}".format(shape(self.gamma_coefficients)[0]))
         return dot(transpose(noise_amplified_exp_vals), self.gamma_coefficients)[0]
 
     def set_experiment_name(self, experiment_name):
@@ -303,8 +287,13 @@ class ZeroNoiseExtrapolation:
         self.experiment_name = experiment_name
         self.experiment_name += "__ZNE_CNOT_REP_"
         self.experiment_name += "_backend" + self.backend.name()
-        self.experiment_name += "_shots" + str(self.get_shots())
-        self.experiment_name += "_paulitwirling" + str(self.pauli_twirl)
+        self.experiment_name += "_errorctrld" + str(self.error_controlled_sampling)
+        if self.error_controlled_sampling:
+            self.experiment_name += "_tol" + str(self.error_tol)
+            self.experiment_name += "_maxshots" + str(self.max_shots)
+        else:
+            self.experiment_name += "_shots" + str(self.shots)
+        self.experiment_name += "_paulitwirl" + str(self.pauli_twirl)
 
     def create_directory(self):
         """
@@ -495,8 +484,7 @@ class ZeroNoiseExtrapolation:
         """
 
         if shots is None:
-            shots = self.shots
-            repeats = self.repeats
+            shots, repeats = self.partition_shots(self.shots)
         else:
             shots, repeats = self.partition_shots(shots)
 
@@ -505,7 +493,7 @@ class ZeroNoiseExtrapolation:
         # Note that several circuits can be entered into the IBMQ queue at once by passing them in a list.
         execution_circuits = [qc.copy() for i in range(repeats)]
 
-        # non-simulator backends throws unexpected argument when passing noise_model argument to them
+        # non-simulator backends throws "unexpected argument" exception when passing noise_model argument to them
         if self.is_simulator:
             job = execute(execution_circuits, backend=self.backend, noise_model=self.noise_model,
                           pass_manager=PassManager(), shots=shots)
@@ -513,7 +501,7 @@ class ZeroNoiseExtrapolation:
             job = execute(execution_circuits, backend=self.backend,
                           pass_manager=PassManager(), shots=shots)
 
-        circuit_measurement_results = job.exp_val()
+        circuit_measurement_results = job.result()
 
         return circuit_measurement_results
 
@@ -540,8 +528,26 @@ class ZeroNoiseExtrapolation:
 
         return average(experiment_exp_vals), average(experiment_variances), asarray(experiment_exp_vals)
 
-    def compute_error_controlled_exp_val(self, noise_amplified_qc: QuantumCircuit, gamma_coeff: float,
-                                         shots: int = None, conf_index: int = 1) -> (float, float, float):
+    def compute_error_controlled_exp_val(self, noise_amplified_qc: QuantumCircuit, gamma_coeff: float, shots: int = None,
+                                         conf_index: int = 2, verbose: bool = False) -> (float, float, float):
+        """
+        Handles optional error controlled sampling of the quantum circuit. Returns the resulting estimated expectation
+        value and variance, and the total number of shots used.
+
+        Parameters
+        ----------
+        noise_amplified_qc: qiskit.QuantumCircuit
+        gamma_coeff: float
+        shots: int
+        conf_index: int
+        verbose: bool
+
+        Returns
+        -------
+        exp_val, variance, shots: float, float, int
+
+        """
+
         if shots is None:
             shots = self.shots
 
@@ -552,7 +558,17 @@ class ZeroNoiseExtrapolation:
         if not self.error_controlled_sampling:
             return exp_val, variance, shots
 
+        if verbose:
+            print("Error controlled sampling, " +
+                  "min_shots={:}, max_shots={:}, error_tol={:}, conf_index={:}".format(shots, self.max_shots,
+                                                                                       self.error_tol, conf_index))
+
         total_shots = int(self.n_amp_factors * (gamma_coeff**2) * (conf_index**2) * (variance / self.error_tol**2))
+
+        if verbose:
+            print("Variance={:.4f}, gamma_coeff={:} need a total of {:} shots for convergence.".format(variance,
+                                                                                                       gamma_coeff,
+                                                                                                       total_shots))
 
         if total_shots <= shots:
             return exp_val, variance, shots
@@ -560,6 +576,9 @@ class ZeroNoiseExtrapolation:
             total_shots = self.max_shots
 
         new_shots = int(total_shots - shots)
+
+        if verbose:
+            print("Executing {:} additional shots.".format(new_shots))
 
         result = self.execute_circuit(qc=noise_amplified_qc, shots=new_shots)
 
@@ -570,20 +589,61 @@ class ZeroNoiseExtrapolation:
 
         return error_controlled_exp_val, error_controlled_variance, total_shots
 
-    def compute_noise_amplified_exp_val(self, amp_factor, gamma_coeff):
+    def compute_noise_amplified_exp_val(self, amp_factor, gamma_coeff, verbose: bool = False):
+        """
+        Creates the noise amplified circuit for a given amplification factors and computes the corresponding estimated
+        expectation value and variance.
+
+        Parameters
+        ----------
+        amp_factor: int
+        gamma_coeff: float
+        verbose: bool
+
+        Returns
+        -------
+        noise_amplified_result: NoiseAmplifiedResult
+
+        """
         noise_amplified_qc = self.noise_amplify_and_pauli_twirl_cnots(qc=self.qc, amp_factor=amp_factor,
                                                                       pauli_twirl=self.pauli_twirl)
 
-        exp_val, variance, total_shots = self.compute_error_controlled_exp_val(noise_amplified_qc, gamma_coeff)
+        if verbose:
+            print("Circuit created. Depth = {:}. Executing.".format(noise_amplified_qc.depth()))
+
+        exp_val, variance, total_shots = self.compute_error_controlled_exp_val(noise_amplified_qc,
+                                                                               gamma_coeff=gamma_coeff,
+                                                                               shots=self.shots, verbose=verbose)
 
         noise_amplified_result = NoiseAmplifiedResult(amp_factor=amp_factor, shots=total_shots,
                                                       qc=noise_amplified_qc, depth=noise_amplified_qc.depth(),
                                                       exp_val=exp_val, variance=variance)
         return noise_amplified_result
 
+    def estimate_error(self) -> float:
+        """
+        Estimate the error in the mitigated expectation value based on the variance found in the noise amplified circuit
+        executions.
+
+        Returns
+        -------
+        error: float
+            Estimated error in the mitigated expectation value.
+        """
+        error = 0
+        for i, amp_res in enumerate(self.noise_amplified_results):
+            variance, shots = amp_res.variance, amp_res.shots
+            gamma_coeff = self.gamma_coefficients[i]
+
+            error += gamma_coeff**2 * (variance / shots)
+
+        error = sqrt(error)
+
+        return error
+
     def mitigate(self, verbose: bool = False) -> float:
         """
-        Perform the quantum error mitigation.
+        Perform the full quantum error mitigation procedure.
 
         Parameters
         ----------
@@ -597,6 +657,9 @@ class ZeroNoiseExtrapolation:
         """
 
         for i, amp_factor in enumerate(self.noise_amplification_factors):
+
+            if verbose:
+                print("Amplification factor = {:}.".format(amp_factor))
 
             noise_amplified_result, result_read_from_file = None, False
 
@@ -616,15 +679,25 @@ class ZeroNoiseExtrapolation:
 
             if not result_read_from_file:
                 noise_amplified_result = self.compute_noise_amplified_exp_val(amp_factor=amp_factor,
-                                                                              gamma_coeff=gamma_coeff)
+                                                                              gamma_coeff=gamma_coeff,
+                                                                              verbose=verbose)
 
                 if self.save_results:
                     self.write_to_file(filename=self.experiment_name + "_r{:}.result".format(amp_factor),
                                        data=noise_amplified_result)
+                    if verbose:
+                        "Noise amplified result successfully written to disk."
 
             self.noise_amplified_results[i] = noise_amplified_result
 
+            if verbose:
+                print("Noise amplified exp val = {:.8f}, ".format(noise_amplified_result.exp_val) +
+                      "variance = {:.8f}, ".format(noise_amplified_result.variance) +
+                      "total shots executed = {:}.".format(noise_amplified_result.shots))
+
         mitigated_exp_val = self.extrapolate(self.get_noise_amplified_exp_vals())
+
+        self.mitigated_exp_val = mitigated_exp_val
 
         self.result = ZeroNoiseExtrapolationResult(qc=self.qc,
                                                    noise_amplified_results=self.noise_amplified_results,
@@ -635,11 +708,11 @@ class ZeroNoiseExtrapolation:
 
         if verbose:
             print("-----\nERROR MITIGATION DONE\n" +
-                  "Bare circuit expectation value: {:}\n".format(self.result.get_bare_exp_val()) +
+                  "Bare circuit expectation value: {:.8f}\n".format(self.result.get_bare_exp_val()) +
                   "Noise amplified expectation values: {:}\n".format(self.result.get_noise_amplified_exp_vals()) +
                   "Circuit depths: {:}\n".format(self.result.get_noise_amplified_circuit_depths()) +
                   "-----\n" +
-                  "Mitigated expectation value: {:}\n".format(self.result.exp_val))
+                  "Mitigated expectation value: {:.8f}\n".format(self.result.exp_val))
 
         return mitigated_exp_val
 
@@ -931,3 +1004,70 @@ def noise_amplify_cnots(qc: QuantumCircuit, amp_factor: int):
     new_qc = QuantumCircuit.from_qasm_str(new_circuit_qasm_str)
 
     return new_qc
+
+if __name__ == "__main__":
+    def swaptest_exp_val_func(results, myfilter=None):
+        exp_vals, variances = zeros(shape(results)), zeros(shape(results))
+        for i, experiment_result in enumerate(results):
+            shots = experiment_result.shots
+            counts = experiment_result.data.counts
+            eigenval = 0
+            esquared = 0
+            for key in counts.keys():
+                if key == "0x0":
+                    eigenval = +1
+                elif key == "0x1":
+                    eigenval = -1
+                exp_vals[i] += eigenval * counts[key] / shots
+                esquared += counts[key] / shots
+            variances[i] = 1 - exp_vals[i]**2
+        return exp_vals, variances
+
+    def add_swaptest_gate(qc, probe, q1, q2, barrier=False):
+        qc.toffoli(probe, q1, q2)
+
+        if barrier:
+            qc.barrier()
+
+        qc.toffoli(probe, q2, q1)
+
+        if barrier:
+            qc.barrier()
+
+        qc.toffoli(probe, q1, q2)
+
+
+    def create_3qswaptest_circuit(barrier=False):
+        qc = QuantumCircuit(3, 1)
+
+        qc.h(0)
+
+        qc.h(1)
+
+        if barrier:
+            qc.barrier()
+
+        add_swaptest_gate(qc, 0, 1, 2, barrier=barrier)
+
+        if barrier:
+            qc.barrier()
+
+        qc.h(0)
+
+        qc.measure(0, 0)
+
+        return qc
+
+    qc = create_3qswaptest_circuit()
+
+    from qiskit.test.mock import FakeAthens
+
+    mock = FakeAthens()
+
+    zne = ZeroNoiseExtrapolation(qc=qc, exp_val_func=swaptest_exp_val_func, backend=mock,
+                                 n_amp_factors=3, shots=10*8192,
+                                 error_controlled_sampling=True, error_tol=0.01, max_shots=100*8192)
+
+    print(zne.mitigate(verbose=True))
+
+    #print(zne.result)
