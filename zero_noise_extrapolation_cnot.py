@@ -17,8 +17,6 @@ abs_path = os.path.dirname(__file__)
 sys.path.append(abs_path)
 sys.path.append(os.path.dirname(abs_path))
 
-from zero_noise_extrapolation import Richardson_extrapolate
-
 from typing import Callable, Union
 
 """
@@ -63,20 +61,25 @@ class ZeroNoiseExtrapolationResult:
     gamma_coefficients: ndarray
     exp_val: float
 
-    def get_bare_exp_val(self) -> float:
+    @property
+    def bare_exp_val(self) -> float:
         return self.noise_amplified_results[0].exp_val
 
-    def get_noise_amplified_exp_vals(self) -> ndarray:
+    @property
+    def noise_amplified_exp_vals(self) -> ndarray:
         return asarray([result.exp_val for result in self.noise_amplified_results])
 
-    def get_noise_amplified_variances(self) -> ndarray:
+    @property
+    def noise_amplified_variances(self) -> ndarray:
         return asarray([result.variance for result in self.noise_amplified_results])
 
-    def get_noise_amplified_circuit_depths(self) -> ndarray:
-        return asarray([result.qc.depth() for result in self.noise_amplified_results])
-
-    def get_noise_amplified_circuit_shots(self) -> ndarray:
+    @property
+    def shots(self) -> ndarray:
         return asarray([result.shots for result in self.noise_amplified_results])
+
+    @property
+    def depths(self) -> ndarray:
+        return asarray([result.qc.depth() for result in self.noise_amplified_results])
 
 
 # Zero-noise extrapolation class:
@@ -206,8 +209,6 @@ class ZeroNoiseExtrapolation:
 
         self.result = None
 
-        self.mitigated_exp_val = None
-
     @staticmethod
     def partition_shots(tot_shots: int) -> (int, int):
         """
@@ -234,14 +235,79 @@ class ZeroNoiseExtrapolation:
                 repeats = (tot_shots // 8192) + 1
             return int(tot_shots / repeats), repeats
 
-    # Useful set and get functions:
+    # We use the @property decorator for certain useful data that we might want to retrieve that are stored within the
+    # noise amplified results
 
-    def get_noise_amplified_exp_vals(self) -> ndarray:
+    @property
+    def bare_exp_val(self) -> float:
+        return self.noise_amplified_results[0].exp_val
+
+    @property
+    def noise_amplified_exp_vals(self) -> ndarray:
         return asarray([result.exp_val for result in self.noise_amplified_results])
 
-    # Error mitigation help functions:
+    @property
+    def noise_amplified_variances(self) -> ndarray:
+        return asarray([result.variance for result in self.noise_amplified_results])
+
+    @property
+    def depths(self) -> ndarray:
+        return asarray([result.qc.depth() for result in self.noise_amplified_results])
+
+    @property
+    def mitigated_exp_val(self) -> float:
+        if self.result is None:
+            return None
+        return self.result.exp_val
+
+    # Functions for computing the Richardson extrapolation
+
+    def extrapolate(self, noise_amplified_exp_vals: ndarray):
+        """
+        The Richardson extrapolation reads
+
+        E^* = \sum_i gamma_i * E(\lambda_i),
+
+        where the gamma_i-coefficients are computed as a function of the amplification factors by solving a system
+        of linear equations, this is done in self.compute_extrapolation_coefficients(), and E(\lambda_i) is the
+        i-th noise amplified expectation value, corresponding to the amplification factor \lambda_i.
+
+        Ref: https://doi.org/10.1098/rsta.1911.0009
+
+        Parameters
+        ----------
+        noise_amplified_exp_vals: numpy.ndarray
+            The noise amplified expectation value, in order corresponding to amplification factors 1, 3, 5, ... , 2n-1.
+
+        Returns
+        -------
+        mitigated_exp_val: float
+            The mitigated expectation value, which is the exp val extrapolated to the zero-noise case.
+        """
+        if self.n_amp_factors == 1:
+            return noise_amplified_exp_vals[0]
+        if not shape(noise_amplified_exp_vals)[0] == shape(self.gamma_coefficients)[0]:
+            raise Exception("Shape mismatch between noise_amplified_exp_vals and gamma_coefficients." +
+                            " length={:}".format(shape(noise_amplified_exp_vals)[0]) +
+                            " does not match length={:}".format(shape(self.gamma_coefficients)[0]))
+        return dot(transpose(noise_amplified_exp_vals), self.gamma_coefficients)[0]
 
     def compute_extrapolation_coefficients(self, n_amp_factors: int = None) -> ndarray:
+        """
+        Compute the gamma_i-coefficients used in the Richardson extrapolation. We assume the specific noise
+        amplification factors to be 1, 3, 5, ..., 2n-1, where n=n_amp_factors is the number of noise amplification
+        factors.
+
+        Parameters
+        ----------
+        n_amp_factors: int
+            Number of amplification factors.
+
+        Returns
+        ----------
+        gamma_coefficients: numpy.ndarray
+            The set of coefficients to be used in the Richardson extrapolation.
+        """
         if n_amp_factors is None:
             n_amp_factors = self.n_amp_factors
         if n_amp_factors == 1:
@@ -251,7 +317,7 @@ class ZeroNoiseExtrapolation:
 
         A, b = zeros((n_amp_factors, n_amp_factors)), zeros((n_amp_factors, 1))
 
-        A[0,:], b[0] = 1, 1
+        A[0, :], b[0] = 1, 1
 
         for k in range(1, n_amp_factors):
             A[k, :] = amplification_factors**k
@@ -260,14 +326,7 @@ class ZeroNoiseExtrapolation:
 
         return gamma_coefficients
 
-    def extrapolate(self, noise_amplified_exp_vals: ndarray):
-        if self.n_amp_factors == 1:
-            return noise_amplified_exp_vals[0]
-        if not shape(noise_amplified_exp_vals)[0] == shape(self.gamma_coefficients)[0]:
-            raise Exception("Shape mismatch between noise_amplified_exp_vals and gamma_coefficients." +
-                            " length={:}".format(shape(noise_amplified_exp_vals)[0]) +
-                            " does not match length={:}".format(shape(self.gamma_coefficients)[0]))
-        return dot(transpose(noise_amplified_exp_vals), self.gamma_coefficients)[0]
+    # Functions involved in saving and loading results from disk
 
     def set_experiment_name(self, experiment_name):
         """
@@ -351,6 +410,8 @@ class ZeroNoiseExtrapolation:
         file = open(directory + "/" + filename, "wb")
         pickle.dump(data, file)
         file.close()
+
+    # Functions for processing and executing the quantum circuits
 
     def noise_amplify_and_pauli_twirl_cnots(self, qc: QuantumCircuit, amp_factor: int,
                                             pauli_twirl: bool) -> QuantumCircuit:
@@ -504,6 +565,8 @@ class ZeroNoiseExtrapolation:
         circuit_measurement_results = job.result()
 
         return circuit_measurement_results
+
+    # Functions involved in computing the noise amplified and mitigated expectation values and related measures.
 
     def compute_exp_val(self, result: Result) -> (float, float, ndarray):
         """
@@ -695,9 +758,7 @@ class ZeroNoiseExtrapolation:
                       "variance = {:.8f}, ".format(noise_amplified_result.variance) +
                       "total shots executed = {:}.".format(noise_amplified_result.shots))
 
-        mitigated_exp_val = self.extrapolate(self.get_noise_amplified_exp_vals())
-
-        self.mitigated_exp_val = mitigated_exp_val
+        mitigated_exp_val = self.extrapolate(self.noise_amplified_exp_vals)
 
         self.result = ZeroNoiseExtrapolationResult(qc=self.qc,
                                                    noise_amplified_results=self.noise_amplified_results,
@@ -708,9 +769,9 @@ class ZeroNoiseExtrapolation:
 
         if verbose:
             print("-----\nERROR MITIGATION DONE\n" +
-                  "Bare circuit expectation value: {:.8f}\n".format(self.result.get_bare_exp_val()) +
-                  "Noise amplified expectation values: {:}\n".format(self.result.get_noise_amplified_exp_vals()) +
-                  "Circuit depths: {:}\n".format(self.result.get_noise_amplified_circuit_depths()) +
+                  "Bare circuit expectation value: {:.8f}\n".format(self.result.bare_exp_val) +
+                  "Noise amplified expectation values: {:}\n".format(self.result.noise_amplified_exp_vals) +
+                  "Circuit depths: {:}\n".format(self.result.depths) +
                   "-----\n" +
                   "Mitigated expectation value: {:.8f}\n".format(self.result.exp_val))
 
