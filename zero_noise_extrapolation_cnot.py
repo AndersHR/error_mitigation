@@ -78,6 +78,10 @@ class ZeroNoiseExtrapolationResult:
         return asarray([result.shots for result in self.noise_amplified_results])
 
     @property
+    def total_shots(self) -> float:
+        return sum(result.shots for result in self.noise_amplified_results)
+
+    @property
     def depths(self) -> ndarray:
         return asarray([result.qc.depth() for result in self.noise_amplified_results])
 
@@ -414,7 +418,7 @@ class ZeroNoiseExtrapolation:
     # Functions for processing and executing the quantum circuits
 
     def noise_amplify_and_pauli_twirl_cnots(self, qc: QuantumCircuit, amp_factor: int,
-                                            pauli_twirl: bool) -> QuantumCircuit:
+                                            pauli_twirl: bool = False) -> QuantumCircuit:
         """
         Amplify CNOT-noise by extending each CNOT-gate as CNOT^amp_factor and possibly Pauli-twirl all CNOT-gates
 
@@ -1066,69 +1070,3 @@ def noise_amplify_cnots(qc: QuantumCircuit, amp_factor: int):
 
     return new_qc
 
-if __name__ == "__main__":
-    def swaptest_exp_val_func(results, myfilter=None):
-        exp_vals, variances = zeros(shape(results)), zeros(shape(results))
-        for i, experiment_result in enumerate(results):
-            shots = experiment_result.shots
-            counts = experiment_result.data.counts
-            eigenval = 0
-            esquared = 0
-            for key in counts.keys():
-                if key == "0x0":
-                    eigenval = +1
-                elif key == "0x1":
-                    eigenval = -1
-                exp_vals[i] += eigenval * counts[key] / shots
-                esquared += counts[key] / shots
-            variances[i] = 1 - exp_vals[i]**2
-        return exp_vals, variances
-
-    def add_swaptest_gate(qc, probe, q1, q2, barrier=False):
-        qc.toffoli(probe, q1, q2)
-
-        if barrier:
-            qc.barrier()
-
-        qc.toffoli(probe, q2, q1)
-
-        if barrier:
-            qc.barrier()
-
-        qc.toffoli(probe, q1, q2)
-
-
-    def create_3qswaptest_circuit(barrier=False):
-        qc = QuantumCircuit(3, 1)
-
-        qc.h(0)
-
-        qc.h(1)
-
-        if barrier:
-            qc.barrier()
-
-        add_swaptest_gate(qc, 0, 1, 2, barrier=barrier)
-
-        if barrier:
-            qc.barrier()
-
-        qc.h(0)
-
-        qc.measure(0, 0)
-
-        return qc
-
-    qc = create_3qswaptest_circuit()
-
-    from qiskit.test.mock import FakeAthens
-
-    mock = FakeAthens()
-
-    zne = ZeroNoiseExtrapolation(qc=qc, exp_val_func=swaptest_exp_val_func, backend=mock,
-                                 n_amp_factors=3, shots=10*8192,
-                                 error_controlled_sampling=True, error_tol=0.01, max_shots=100*8192)
-
-    print(zne.mitigate(verbose=True))
-
-    #print(zne.result)
